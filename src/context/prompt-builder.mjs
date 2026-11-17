@@ -308,6 +308,42 @@ export async function extractInstructionDirectories(text) {
 }
 
 /**
+ * Resolves existing, non-root safe directories for `--add-dir` and ephemeral `read_file(<dir>)` rules.
+ */
+export async function discoverSafeReadDirs({
+  root = '',
+  extraDirs = [],
+  allowedPdfRoots = [],
+  verifiedLocalFiles = [],
+  instructionTexts = []
+} = {}) {
+  const candidates = [
+    root,
+    ...(root && basename(resolve(root)).toLowerCase() === 'agent-runtime' ? [dirname(resolve(root))] : []),
+    join(homedir(), 'Zotero'),
+    join(homedir(), 'OneDrive'),
+    join(homedir(), 'Documents'),
+    join(homedir(), 'Downloads'),
+    ...extraDirs,
+    ...allowedPdfRoots,
+    ...verifiedLocalFiles.map((f) => dirname(f.path))
+  ];
+
+  for (const text of instructionTexts) {
+    if (typeof text === 'string' && text.trim()) {
+      candidates.push(...(await extractInstructionDirectories(text)));
+    }
+  }
+
+  const resolvedSet = new Set();
+  for (const candidate of candidates) {
+    const resolvedDir = await resolveExistingDirectory(candidate);
+    if (resolvedDir) resolvedSet.add(resolvedDir);
+  }
+  return [...resolvedSet];
+}
+
+/**
  * Builds a bounded, injection-hardened prompt for agy headless turns.
  * System instructions and skills are injected only on the first turn of a session.
  */
@@ -399,28 +435,22 @@ export async function buildTurnPrompt(body, { resumed = false, config }) {
   }
 
   // 3. Resolve existing, non-root read directories for `--add-dir` & `read_file(<dir>)`
-  const candidateAddDirs =
-    localDocuments.length > 0
-      ? [...localDocuments.map((doc) => dirname(doc.absolutePath)), ...config.extraDirs]
-      : [
-          config.root,
-          ...(config.root && basename(resolve(config.root)).toLowerCase() === 'agent-runtime'
-            ? [dirname(resolve(config.root))]
-            : []),
-          join(homedir(), 'Zotero'),
-          join(homedir(), 'OneDrive'),
-          join(homedir(), 'Documents'),
-          join(homedir(), 'Downloads'),
-          ...config.extraDirs,
-          ...config.allowedPdfRoots,
-          ...verifiedLocalFiles.map((f) => dirname(f.path)),
-          ...(await extractInstructionDirectories(str(metadata.customInstruction)))
-        ];
-
-  const addDirsSet = new Set();
-  for (const candidate of candidateAddDirs) {
-    const resolvedDir = await resolveExistingDirectory(candidate);
-    if (resolvedDir) addDirsSet.add(resolvedDir);
+  let extraAddDirs;
+  if (localDocuments.length > 0) {
+    const addDirsSet = new Set();
+    for (const candidate of [...localDocuments.map((doc) => dirname(doc.absolutePath)), ...config.extraDirs]) {
+      const resolvedDir = await resolveExistingDirectory(candidate);
+      if (resolvedDir) addDirsSet.add(resolvedDir);
+    }
+    extraAddDirs = [...addDirsSet];
+  } else {
+    extraAddDirs = await discoverSafeReadDirs({
+      root: config.root,
+      extraDirs: config.extraDirs,
+      allowedPdfRoots: config.allowedPdfRoots,
+      verifiedLocalFiles,
+      instructionTexts: [str(metadata.customInstruction)]
+    });
   }
 
   pieces.push(`User request:\n${str(b.userText)}`);
@@ -431,6 +461,6 @@ export async function buildTurnPrompt(body, { resumed = false, config }) {
     localPdfReplacements: buildLocalPdfReplacements(localDocuments),
     verifiedLocalFiles,
     rejectedLocalFiles,
-    extraAddDirs: [...addDirsSet]
+    extraAddDirs
   };
 }

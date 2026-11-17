@@ -5,12 +5,12 @@
 
 ## 1. Automated Test Results (Mock CLI & Unit Tests)
 
-> **Important distinction**: Automated `npm test` and `npm run test:unit` verify bridge logic, HTTP/NDJSON framing, error handling, `finished_reason` guards, secret/PDF-path redaction, local PDF `%PDF-` checks, MCP Bearer token capture, per-turn ephemeral `--settings` & `rules/AGENTS.md` generation, default direct-write permissions (`AGY_ZOTERO_MCP_ALLOW_WRITE=0` / `plan` opt-out), M4 persistent `stdin stream-json` process reuse + non-negative usage deltas, and cancellation against `test/mock-agy.mjs` and mock HTTP/MCP servers.
+> **Important distinction**: Automated `npm test` and `npm run test:unit` verify bridge logic, HTTP/NDJSON framing, `claude-code-agy.mjs` stdio `@anthropic-ai/claude-agent-sdk` shim protocol, managed `bridge.mjs` CLI flags (`CLAUDE_BRIDGE_READY`, `ADAPTER_AUTH_TOKEN`, `--exit-on-stdin-close`), error handling, `finished_reason` guards, secret/PDF-path redaction, local PDF `%PDF-` checks, MCP Bearer token capture, per-turn ephemeral `--settings` & `rules/AGENTS.md` generation, default direct-write permissions (`AGY_ZOTERO_MCP_ALLOW_WRITE=0` / `plan` opt-out), M4 persistent `stdin stream-json` process reuse + non-negative usage deltas, and cancellation against `test/mock-agy.mjs` and mock HTTP/MCP servers.
 
 | Suite / Command | Scope | Pass / Total | Notes |
 | --- | --- | --- | --- |
-| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 25 / 25 | Runs offline inside sandbox (real `agy 1.5.9` variant-to-base-model grouping, `splitModelVariant` & `resolveAgyModelAndEffort`, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, `normalizeCumulativeUsage` & `SessionProcessPool`) |
-| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/unit.test.mjs`) | 47 / 47 | Original 10 baseline integration tests + 12 new HTTP integration tests (including M4 pooled PID reuse & `(model, effort)` normalization) + 25 unit tests |
+| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 26 / 26 | Runs offline inside sandbox (real `agy 1.5.9` variant-to-base-model grouping, `splitModelVariant` & `resolveAgyModelAndEffort`, `parseClaudeShimArgs` & `ensureWindowsClaudeCmdShim`, managed bridge CLI flags, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, `normalizeCumulativeUsage` & `SessionProcessPool`) |
+| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/unit.test.mjs`) | 50 / 50 | Original 10 baseline integration tests + 14 new HTTP/shim integration tests (including M4 pooled PID reuse, `(model, effort)` normalization, `claude-code-agy.mjs` SDK stdio E2E, and managed `bridge.mjs` lifecycle) + 26 unit tests |
 
 ### Original 10 Baseline Integration Tests (`test/bridge.test.mjs`)
 1. `health and model discovery match plugin contract` — PASS
@@ -37,6 +37,8 @@
 20. `mcp-servers handles 401 before turn and captures Bearer token + tools during Zotero run-turn` — PASS
 21. `runtime-retention, invalidate-session, and invalidate-all-hot-runtimes respect pool opt-in` — PASS
 22. `run-turn and efforts normalize base models, legacy suffixed variants, and auto effort cleanly` — PASS
+23. `claude-code-agy.mjs speaks Claude Code CLI stream-json protocol for direct Claude Code path use` — PASS
+24. `bridge.mjs supports managed CLI flags, ADAPTER_AUTH_TOKEN, CLAUDE_BRIDGE_READY, and stdin close exit` — PASS
 
 ## 2. Live E2E Observations (`agy.exe 1.5.9` + Zotero `10.0.8` + `llm-for-zotero v3.9.19`)
 
@@ -50,13 +52,14 @@ Verified against the user's live Windows machine:
 - **Live Zotero `10.0.8` + `llm-for-zotero v3.9.19` E2E**:
   - `GET /mcp-servers?probe=1` → returned `connected: true`, `status: "connected"`, `protocolVersion: "2025-06-18"`, `toolCount: 27` for `llm_for_zotero_profile_a28d39e2` (`v1.0.0` defaults `writeEnabled: true`).
   - Live `Library chat` turn (`gemini-3.8-flash-low`) → executed Zotero MCP library search in `default` safe mode via workspace `.agents/plugins/llm-for-zotero/` + ephemeral `--settings session-settings.json` and returned accurate paper titles, authors, and years.
-  - User manually verified **single-paper close reading / experiment analysis** and **cross-paper comparison** in Zotero `10.0.8` (`llm-for-zotero v3.9.19`).
+  - User manually verified **single-paper close reading / experiment analysis**, **cross-paper comparison**, and separated **base model + Thinking Level** dropdowns in Zotero `10.0.8` (`llm-for-zotero v3.9.19`).
 
 ## 3. Remaining E2E Tests to Try in Zotero UI
 
 | Item | Status | Reason | Minimal Verification Step |
 | --- | --- | --- | --- |
-| Live Zotero Note/Tag direct write (`note_write`, tags) & readback | Ready in `v1.0.0` (`writeEnabled: true` default) | User authorized removing default read-only restriction; mock/unit verified | Restart `node .\bridge.mjs`, test creating/appending a note or adding a tag on a target item in Zotero UI and check readback confirmation |
+| Live Managed Zotero mode via **Claude Code path** (`claude-code-agy.mjs`) | Ready for UI test (mock/SDK protocol verified) | Zotero built-in bridge manages startup automatically when *Use my own bridge* is off | Set **Claude Code path** to `<repo>\claude-code-agy.mjs`, uncheck *Use my own bridge*, click **Restart bridge** & Refresh models |
+| Live Zotero Note/Tag direct write (`note_write`, tags) & readback | Ready in `v1.0.0` (`writeEnabled: true` default) | User authorized removing default read-only restriction; mock/unit verified | Restart bridge, test creating/appending a note or adding a tag on a target item in Zotero UI and check readback confirmation |
 | Live multi-turn persistent daemon pool reuse (`AGY_PROCESS_POOL=1`) | Opt-in / mock-verified | `AGY_PROCESS_POOL` defaults to `0` (`v0` one-process-per-turn); `--input-format stream-json` CLI args verified on `agy.exe 1.5.9` | Start bridge with `$env:AGY_PROCESS_POOL="1"` across multiple Zotero turns in one conversation |
 
 ## 4. Rollback Plan

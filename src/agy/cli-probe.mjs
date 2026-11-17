@@ -367,7 +367,7 @@ export class CliProbe {
       protocolVersion: 2,
       capabilities: ['local_pdf_paths', 'model_catalog_v1', 'permission_modes_v1', 'structured_completion_v1'],
       bridgeVersion: this.config.bridgeVersion,
-      managedBy: 'agy-zotero-bridge',
+      managedBy: this.config.managedBy || 'agy-zotero-bridge',
       agyVersion: version,
       agyInstalled: installed,
       agyAvailable: installed,

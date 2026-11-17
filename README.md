@@ -1,24 +1,33 @@
-# agy → llm-for-zotero HTTP Bridge (v1.0.0)
+# agy → llm-for-zotero Bridge (`v1.0.0`)
 
-Standalone, zero-dependency Node 20+ HTTP bridge that drives the official Antigravity CLI (`agy`) in headless mode for `llm-for-zotero`'s **Use my own bridge** backend. Preserves full backwards compatibility with v0.1.0 while providing live-verified Zotero MCP read & direct write capabilities (`writeEnabled: true` by default; `plan` mode / `AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), ephemeral per-turn `--settings` permissions, workspace plugin rules, `local_pdf_paths` support, `/structured-completion`, and opt-in M4 persistent `stdin stream-json` process pooling (`AGY_PROCESS_POOL=1`).
+Standalone, zero-dependency Node 20+ integration that drives the official Antigravity CLI (`agy`) for `llm-for-zotero` in **both** modes:
+1. **Managed Mode (Direct `Claude Code path` — No manual server needed)**: Fill `<repo>\claude-code-agy.mjs` (or `claude-code-agy.cmd` on Windows) directly into Zotero Settings → **Agent** → **Advanced** → **Claude Code path**, and leave **Use my own bridge** unchecked. Zotero automatically launches and manages the runtime!
+2. **Custom Bridge Mode (`Use my own bridge`)**: Run `node .\bridge.mjs` yourself and point Zotero's Bridge URL to `http://127.0.0.1:8765`.
 
-## 1. Prerequisites (native Windows / PowerShell)
+Both modes provide grouped base-model discovery + independent Thinking Level (`effort`) selection, Zotero MCP read & direct write capabilities (`writeEnabled: true` by default; `plan` mode / `AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), ephemeral per-turn `--settings` permissions, workspace plugin rules, `local_pdf_paths` support, structured completion, and opt-in M4 persistent pooling.
 
-1. Install **Node.js 20+**.
-2. Install and authenticate the official Antigravity CLI (`agy`) interactively (`agy` in PowerShell).
-3. Verify CLI availability and models:
-   ```powershell
-   agy --version
-   agy models
-   ```
+## 1. Quick Setup (Windows / PowerShell)
+
+### Option A: Direct `Claude Code path` (Recommended, Managed by Zotero)
+1. Install **Node.js 20+** and authenticate `agy` (`agy --version` / `agy models`).
    *(On Windows, the bridge automatically checks `%USERPROFILE%\.gemini\bin\agy.exe` if `AGY_BIN` is unset.)*
-4. Run the bridge from this directory:
+2. Open Zotero → **Settings** → **llm-for-zotero** → **Agent** → expand **高级 / Advanced**:
+   - Uncheck **Use my own bridge**.
+   - In **Claude Code path**, enter the full path to `claude-code-agy.mjs`:
+     ```text
+     <path-to-repo>\claude-code-agy.mjs
+     ```
+     *(On Windows you can also enter `<path-to-repo>\claude-code-agy.cmd`; `ensureWindowsClaudeCmdShim()` provisions `node_modules\@anthropic-ai\claude-code\cli.js` for Zotero's Windows `.cmd` shim resolver.)*
+3. Click **Restart bridge** (or toggle Claude Code mode / Refresh models) and select your base model + Reasoning Effort in Zotero.
+
+### Option B: Standalone Server (`Use my own bridge`)
+1. Run the bridge from this directory:
    ```powershell
    $env:AGY_CWD = "$env:USERPROFILE\Zotero\agent-runtime"
    $env:AGY_BRIDGE_PORT = "8765"
    node .\bridge.mjs
    ```
-5. Point `llm-for-zotero` (**Use my own bridge**) to `http://127.0.0.1:8765`.
+2. Check **Use my own bridge** in `llm-for-zotero` and enter `http://127.0.0.1:8765`.
 
 > **Security notice**: Keep `AGY_BRIDGE_HOST=127.0.0.1` (loopback only). Non-loopback bindings are refused unless `AGY_ALLOW_REMOTE=1` is explicitly set. Never enable `AGY_ALLOW_YOLO=1` unless you explicitly accept unprompted tool execution.
 
@@ -43,9 +52,12 @@ Run reproducible real-CLI PowerShell smoke script (requires an authenticated `ag
 
 ```text
 agy-zotero-bridge/
-├── bridge.mjs                     # Entrypoint (exports createConfig, startBridgeServer)
+├── bridge.mjs                     # HTTP bridge entrypoint (supports standalone & managed CLI flags)
+├── claude-code-agy.mjs            # Drop-in executable for Zotero "Claude Code path" (all platforms)
+├── claude-code-agy.cmd            # Windows .cmd wrapper for Zotero "Claude Code path"
 ├── src/
-│   ├── config.mjs                 # Validated env config & Windows agy.exe resolution
+│   ├── config.mjs                 # Validated env/CLI config & Windows agy.exe resolution
+│   ├── claude-sdk/cli-shim.mjs    # Claude Code CLI/SDK stdio stream-json & control_request shim
 │   ├── http/server.mjs            # HTTP routing, token auth, JSON/NDJSON responses
 │   ├── agy/cli-probe.mjs          # Version, model banner parsing, effort & health probes
 │   ├── agy/process-pool.mjs       # Opt-in M4 pool retention, LRU/TTL eviction, usage delta normalization
@@ -119,6 +131,6 @@ agy-zotero-bridge/
 
 ## 6. Known Boundaries & Rollback
 
-- **Automated vs Live E2E**: All **45** automated tests verify protocol, `finished_reason` truncation safety, security, cancellation, `local_pdf_paths`, MCP auth/settings/rules injection, default Zotero write support (`AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), M4 persistent `stdin stream-json` PID reuse + cumulative usage deltas, and error behavior against mock CLI/MCP endpoints. Live Windows E2E on Zotero `10.0.8` + `llm-for-zotero v3.9.19` + `agy.exe 1.5.9` has passed for `models`, `/structured-completion`, `/mcp-servers?probe=1`, library search, single-paper close reading & experiment analysis, and cross-paper comparison. Live Zotero write execution (`note_write` / tag updates) and live `AGY_PROCESS_POOL=1` long-run multi-turn reuse should now be exercised directly in Zotero UI.
+- **Automated vs Live E2E**: All **50** automated tests (`26` unit + `24` integration) verify protocol, `claude-code-agy.mjs` direct `Claude Code path` SDK stdio shim, managed `bridge.mjs` CLI flags (`--port 0`, `--zotero-root`, `--exit-on-stdin-close 1`, `ADAPTER_AUTH_TOKEN`, `CLAUDE_BRIDGE_READY`), grouped base-model / `effort` resolution, `finished_reason` truncation safety, security, cancellation, `local_pdf_paths`, MCP auth/settings/rules injection, default Zotero write support (`AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), M4 persistent `stdin stream-json` PID reuse + cumulative usage deltas, and error behavior against mock CLI/MCP endpoints. Live Windows E2E on Zotero `10.0.8` + `llm-for-zotero v3.9.19` + `agy.exe 1.5.9` has passed for `models`, `/structured-completion`, `/mcp-servers?probe=1`, library search, single-paper close reading & experiment analysis, cross-paper comparison, and grouped model/reasoning separation in **Use my own bridge** mode. Live Zotero Managed mode via **Claude Code path** (`claude-code-agy.mjs`), live Zotero write execution (`note_write` / tag updates), and live `AGY_PROCESS_POOL=1` long-run multi-turn reuse should now be exercised directly in Zotero UI.
 - **Process Execution Default**: Default mode remains safe one-process-per-turn (`AGY_PROCESS_POOL` unset); set `AGY_PROCESS_POOL=1` to enable persistent `stdin stream-json` multi-turn reuse.
 - **Rollback**: Stop `bridge.mjs`, set `$env:AGY_ZOTERO_MCP_ALLOW_WRITE="0"` to restore strict read-only MCP enforcement, unset `AGY_PROCESS_POOL` to return to stateless one-process-per-turn execution, or switch `llm-for-zotero` back from *Use my own bridge* to its built-in backend.

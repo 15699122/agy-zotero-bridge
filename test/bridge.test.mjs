@@ -5,10 +5,12 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const folder = fileURLToPath(new URL('.', import.meta.url));
 const bridge = fileURLToPath(new URL('../bridge.mjs', import.meta.url));
+const claudeShim = fileURLToPath(new URL('../claude-code-agy.mjs', import.meta.url));
 const binary = process.execPath;
 const prefix = JSON.stringify([join(folder, 'mock-agy.mjs')]);
 const port = 12350 + Math.floor(Math.random() * 2000);
@@ -762,4 +764,228 @@ test('run-turn and efforts normalize base models, legacy suffixed variants, and 
 
   const f3 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-3', { model: 'gemini-3.8-flash', effort: 'auto' });
   assert.deepEqual(JSON.parse(f3.at(-1).outcome.text), { model: 'gemini-3.8-flash', effort: null });
+});
+
+test('claude-code-agy.mjs speaks Claude Code CLI stream-json protocol for direct Claude Code path use', async () => {
+  const shimDir = await mkdtemp(join(tmpdir(), 'agy-claude-shim-e2e-'));
+  try {
+    // 1. Check --version
+    const verOut = await new Promise((resolveVer, rejectVer) => {
+      const p = spawn(process.execPath, [claudeShim, '--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      p.stdout.on('data', (d) => (out += d));
+      p.on('error', rejectVer);
+      p.on('close', (code) => {
+        assert.equal(code, 0);
+        resolveVer(out.trim());
+      });
+    });
+    assert.match(verOut, /^2\.1\.0.*agy-zotero-bridge/);
+
+    // 2. Drive initialize + empty probe + full tool/text turn + get_context_usage + follow-up turn
+    const mcpCfg = JSON.stringify({
+      mcpServers: {
+        llm_for_zotero_p1: {
+          type: 'http',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: { Authorization: 'Bearer shim-secret-tok' }
+        }
+      }
+    });
+    const proc = spawn(
+      process.execPath,
+      [
+        claudeShim,
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--input-format',
+        'stream-json',
+        '--model',
+        'gemini-3.8-flash-low',
+        '--effort',
+        'high',
+        '--mcp-config',
+        mcpCfg,
+        '--allowedTools',
+        'mcp__llm_for_zotero_p1__library_search'
+      ],
+      {
+        cwd: shimDir,
+        env: {
+          ...process.env,
+          AGY_BIN: binary,
+          AGY_PREFIX_ARGS_JSON: prefix
+        },
+        stdio: ['pipe', 'pipe', 'pipe']
+      }
+    );
+
+    const lines = [];
+    const waiters = [];
+    const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
+    rl.on('line', (line) => {
+      const parsed = JSON.parse(line);
+      lines.push(parsed);
+      while (waiters.length > 0 && waiters[0].pred(parsed)) {
+        waiters.shift().resolve(parsed);
+      }
+    });
+    const waitForFrame = (pred, label) => {
+      const existing = lines.find(pred);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolveFrame, rejectFrame) => {
+        const timer = setTimeout(() => rejectFrame(new Error(`Timed out waiting for ${label}`)), 5000);
+        waiters.push({
+          pred,
+          resolve: (v) => {
+            clearTimeout(timer);
+            resolveFrame(v);
+          }
+        });
+      });
+    };
+
+    proc.stdin.write(
+      JSON.stringify({
+        type: 'control_request',
+        request_id: 'init-1',
+        request: { subtype: 'initialize', systemPrompt: ['System rules line.'] }
+      }) + '\n'
+    );
+    const initResp = await waitForFrame(
+      (f) => f.type === 'control_response' && f.response?.request_id === 'init-1',
+      'initialize control_response'
+    );
+    assert.equal(initResp.response.subtype, 'success');
+    assert.equal(initResp.response.response.models[0].value, 'gemini-mock');
+
+    // Empty probe message should not emit a turn result
+    proc.stdin.write(
+      JSON.stringify({
+        type: 'user',
+        session_id: '',
+        parent_tool_use_id: null,
+        message: { role: 'user', content: [{ type: 'text', text: '' }] }
+      }) + '\n'
+    );
+
+    // Real user turn with tool lifecycle
+    proc.stdin.write(
+      JSON.stringify({
+        type: 'user',
+        session_id: '',
+        parent_tool_use_id: null,
+        message: { role: 'user', content: [{ type: 'text', text: 'MOCK_TOOL' }] }
+      }) + '\n'
+    );
+    const res1 = await waitForFrame((f) => f.type === 'result', 'first turn result');
+    assert.equal(res1.subtype, 'success');
+    assert.equal(res1.is_error, false);
+    assert.equal(res1.result, 'Hello');
+    assert.equal(res1.session_id, 'abc-test-session');
+    assert.ok(lines.some((f) => f.type === 'system' && f.subtype === 'init' && f.session_id === 'abc-test-session'));
+    assert.ok(lines.some((f) => f.type === 'assistant' && f.message?.content?.[0]?.type === 'tool_use'));
+    assert.ok(lines.some((f) => f.type === 'user' && f.message?.content?.[0]?.type === 'tool_result'));
+    assert.ok(lines.some((f) => f.type === 'stream_event' && f.event?.delta?.text === 'Hel'));
+
+    // Ephemeral workspace MCP plugin & settings created without touching global config
+    const pluginJson = JSON.parse(await readFile(join(shimDir, '.agents', 'plugins', 'llm-for-zotero', 'plugin.json'), 'utf8'));
+    assert.equal(pluginJson.name, 'llm-for-zotero');
+
+    // get_context_usage query
+    proc.stdin.write(
+      JSON.stringify({
+        type: 'control_request',
+        request_id: 'ctx-1',
+        request: { subtype: 'get_context_usage' }
+      }) + '\n'
+    );
+    const ctxResp = await waitForFrame(
+      (f) => f.type === 'control_response' && f.response?.request_id === 'ctx-1',
+      'get_context_usage'
+    );
+    assert.equal(ctxResp.response.response.totalTokens, 12);
+
+    // Follow-up turn checks normalized base model + effort
+    const turn2StartIdx = lines.length;
+    proc.stdin.write(
+      JSON.stringify({
+        type: 'user',
+        session_id: 'abc-test-session',
+        parent_tool_use_id: null,
+        message: { role: 'user', content: 'MOCK_ECHO_MODEL_EFFORT' }
+      }) + '\n'
+    );
+    const res2 = await waitForFrame(
+      (f) => lines.indexOf(f) >= turn2StartIdx && f.type === 'result',
+      'second turn result'
+    );
+    assert.deepEqual(JSON.parse(res2.result), { model: 'gemini-3.8-flash', effort: 'high' });
+
+    proc.stdin.end();
+    const exitCode = await new Promise((resolveExit) => proc.once('close', resolveExit));
+    rl.close();
+    assert.equal(exitCode, 0);
+  } finally {
+    await rm(shimDir, { recursive: true, force: true });
+  }
+});
+
+test('bridge.mjs supports managed CLI flags, ADAPTER_AUTH_TOKEN, CLAUDE_BRIDGE_READY, and stdin close exit', async () => {
+  const zoteroRoot = await mkdtemp(join(tmpdir(), 'agy-managed-bridge-test-'));
+  const childProc = spawn(
+    process.execPath,
+    [
+      bridge,
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '0',
+      '--zotero-root',
+      zoteroRoot,
+      '--managed-by',
+      'llm-for-zotero',
+      '--exit-on-stdin-close',
+      '1'
+    ],
+    {
+      env: {
+        ...process.env,
+        AGY_BIN: binary,
+        AGY_PREFIX_ARGS_JSON: prefix,
+        ADAPTER_AUTH_TOKEN: 'managed-secret-tok'
+      },
+      stdio: ['pipe', 'pipe', 'pipe']
+    }
+  );
+
+  try {
+    const ready = await new Promise((resolveReady, rejectReady) => {
+      const timer = setTimeout(() => rejectReady(new Error('Timed out waiting for CLAUDE_BRIDGE_READY')), 5000);
+      const rl = createInterface({ input: childProc.stdout, crlfDelay: Infinity });
+      rl.on('line', (line) => {
+        if (line.startsWith('CLAUDE_BRIDGE_READY ')) {
+          clearTimeout(timer);
+          rl.close();
+          resolveReady(JSON.parse(line.slice('CLAUDE_BRIDGE_READY '.length)));
+        }
+      });
+    });
+
+    assert.ok(Number.isInteger(ready.port) && ready.port > 0);
+    const unauth = await fetch(`http://127.0.0.1:${ready.port}/healthz`);
+    assert.equal(unauth.status, 401);
+
+    const health = await (await fetch(`http://127.0.0.1:${ready.port}/managed-secret-tok/healthz`)).json();
+    assert.equal(health.ok, true);
+    assert.equal(health.managedBy, 'llm-for-zotero');
+
+    childProc.stdin.end();
+    const exitCode = await new Promise((resolveExit) => childProc.once('close', resolveExit));
+    assert.equal(exitCode, 0);
+  } finally {
+    childProc.kill();
+    await rm(zoteroRoot, { recursive: true, force: true });
+  }
 });

@@ -1,0 +1,756 @@
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import { CliProbe, resolveAgyModelAndEffort } from '../agy/cli-probe.mjs';
+import { killProcessTree, permissionArgs } from '../agy/process-runner.mjs';
+import { BRIDGE_VERSION, createConfig } from '../config.mjs';
+import { discoverSafeReadDirs } from '../context/prompt-builder.mjs';
+import { prepareScopedMcpPlugin, probeZoteroMcp, writeScopedAgySettingsFile } from '../mcp/zotero-mcp.mjs';
+import { classifyAgyError, createTurnEventMapper } from '../protocol/event-mapper.mjs';
+import { redactSensitive } from '../security/redact.mjs';
+
+const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+
+const BOOLEAN_FLAGS = new Set([
+  '--version',
+  '-v',
+  '--help',
+  '-h',
+  '--verbose',
+  '--allow-dangerously-skip-permissions',
+  '--strict-mcp-config',
+  '--include-partial-messages',
+  '--fork-session',
+  '--no-session-persistence',
+  '--continue'
+]);
+
+/**
+ * Parses CLI flags passed by `@anthropic-ai/claude-agent-sdk` (supporting both `--flag val`
+ * and `--flag=val`, repeatable `--add-dir`, and `--tools ""`).
+ */
+export function parseClaudeShimArgs(argv = []) {
+  const out = {
+    version: false,
+    help: false,
+    outputFormat: 'text',
+    inputFormat: 'text',
+    model: '',
+    effort: '',
+    permissionMode: 'default',
+    allowYoloFlag: false,
+    resume: '',
+    sessionId: '',
+    mcpConfig: '',
+    allowedTools: [],
+    disallowedTools: [],
+    hasToolsFlag: false,
+    tools: 'default',
+    settingSources: [],
+    jsonSchema: '',
+    settings: '',
+    addDirs: [],
+    noSessionPersistence: false,
+    maxTurns: '',
+    promptParts: []
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const raw = String(argv[i] ?? '');
+    if (!raw.startsWith('-')) {
+      out.promptParts.push(raw);
+      continue;
+    }
+
+    const eqIdx = raw.indexOf('=');
+    const flag = eqIdx > 0 ? raw.slice(0, eqIdx) : raw;
+    const inlineVal = eqIdx > 0 ? raw.slice(eqIdx + 1) : undefined;
+
+    if (BOOLEAN_FLAGS.has(flag)) {
+      if (flag === '--version' || flag === '-v') out.version = true;
+      else if (flag === '--help' || flag === '-h') out.help = true;
+      else if (flag === '--allow-dangerously-skip-permissions') out.allowYoloFlag = true;
+      else if (flag === '--no-session-persistence') out.noSessionPersistence = true;
+      continue;
+    }
+
+    const takeVal = () => {
+      if (inlineVal !== undefined) return inlineVal;
+      if (i + 1 < argv.length) {
+        i += 1;
+        return String(argv[i] ?? '');
+      }
+      return '';
+    };
+
+    switch (flag) {
+      case '--output-format':
+        out.outputFormat = takeVal();
+        break;
+      case '--input-format':
+        out.inputFormat = takeVal();
+        break;
+      case '--model':
+        out.model = takeVal();
+        break;
+      case '--effort':
+        out.effort = takeVal();
+        break;
+      case '--permission-mode':
+        out.permissionMode = takeVal();
+        break;
+      case '--resume':
+        out.resume = takeVal();
+        break;
+      case '--session-id':
+        out.sessionId = takeVal();
+        break;
+      case '--mcp-config':
+        out.mcpConfig = takeVal();
+        break;
+      case '--allowedTools':
+        out.allowedTools.push(
+          ...takeVal()
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        );
+        break;
+      case '--disallowedTools':
+        out.disallowedTools.push(
+          ...takeVal()
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        );
+        break;
+      case '--tools':
+        out.hasToolsFlag = true;
+        out.tools = takeVal();
+        break;
+      case '--setting-sources':
+        out.settingSources.push(
+          ...takeVal()
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        );
+        break;
+      case '--json-schema':
+        out.jsonSchema = takeVal();
+        break;
+      case '--settings':
+        out.settings = takeVal();
+        break;
+      case '--add-dir': {
+        const dir = takeVal().trim();
+        if (dir) out.addDirs.push(dir);
+        break;
+      }
+      case '--max-turns':
+        out.maxTurns = takeVal();
+        break;
+      case '--permission-prompt-tool':
+      case '--debug-file':
+      case '--fallback-model':
+      case '--agent':
+      case '--betas':
+      case '--resume-session-at':
+      case '--channels':
+      case '--plugin-dir':
+      case '--plugin-dir-no-mcp':
+      case '--thinking':
+      case '--max-thinking-tokens':
+      case '--thinking-display':
+      case '--max-budget-usd':
+      case '--task-budget':
+      case '--managed-settings':
+      case '--workload':
+        takeVal();
+        break;
+      default:
+        // Consume value if next token looks non-flag and no inline '=' was present
+        if (inlineVal === undefined && i + 1 < argv.length && !String(argv[i + 1]).startsWith('-')) {
+          i += 1;
+        }
+        break;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Parses `--mcp-config` JSON strings or file paths into a `{ serverName: config }` map.
+ */
+async function loadMcpServersArg(rawMcpConfig) {
+  const raw = String(rawMcpConfig || '').trim();
+  if (!raw) return {};
+
+  let text = raw;
+  if (!raw.startsWith('{')) {
+    try {
+      text = await readFile(raw, 'utf8');
+    } catch {
+      return {};
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    const candidate = parsed?.mcpServers && typeof parsed.mcpServers === 'object' ? parsed.mcpServers : parsed;
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return {};
+    return Object.fromEntries(
+      Object.entries(candidate).filter(([, cfg]) => cfg && typeof cfg === 'object' && !Array.isArray(cfg) && (cfg.url || cfg.serverUrl))
+    );
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Extracts plain text prompt content from an SDK `user` JSONL line.
+ */
+export function extractSdkUserText(msg) {
+  const content = msg?.message?.content ?? msg?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string') {
+          return part.text;
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  return '';
+}
+
+/**
+ * Ensures `node_modules/@anthropic-ai/claude-code/cli.js` exists inside `repoRoot`
+ * so `llm-for-zotero`'s `resolveWindowsClaudeShim()` works when `claude-code-agy.cmd`
+ * is configured in Windows **Claude Code path**.
+ */
+export async function ensureWindowsClaudeCmdShim(repoRoot = REPO_ROOT) {
+  const pkgDir = join(resolve(repoRoot), 'node_modules', '@anthropic-ai', 'claude-code');
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(
+    join(pkgDir, 'package.json'),
+    JSON.stringify(
+      {
+        name: '@anthropic-ai/claude-code',
+        version: '2.1.0',
+        type: 'module',
+        bin: {
+          claude: './cli.js'
+        }
+      },
+      null,
+      2
+    ) + '\n',
+    'utf8'
+  );
+  await writeFile(
+    join(pkgDir, 'cli.js'),
+    "#!/usr/bin/env node\nimport { runClaudeCodeAgyShim } from '../../../src/claude-sdk/cli-shim.mjs';\nawait runClaudeCodeAgyShim();\n",
+    'utf8'
+  );
+  return pkgDir;
+}
+
+/**
+ * Runs the Claude Code CLI / `@anthropic-ai/claude-agent-sdk` stdio `stream-json`
+ * subprocess shim backed by `agy`.
+ */
+export async function runClaudeCodeAgyShim({
+  argv = process.argv.slice(2),
+  env = process.env,
+  cwd = process.cwd(),
+  stdin = process.stdin,
+  stdout = process.stdout,
+  stderr = process.stderr
+} = {}) {
+  const parsed = parseClaudeShimArgs(argv);
+
+  if (parsed.version) {
+    stdout.write(`2.1.0 (Claude Code / agy-zotero-bridge ${BRIDGE_VERSION})\n`);
+    return 0;
+  }
+
+  if (parsed.help) {
+    stdout.write(
+      `agy-zotero-bridge Claude Code CLI shim (${BRIDGE_VERSION})\n` +
+        'Drop-in executable for llm-for-zotero "Claude Code path". Supports --version and --output-format stream-json --input-format stream-json.\n'
+    );
+    return 0;
+  }
+
+  const workCwd = resolve(cwd || process.cwd());
+  const config = createConfig({ ...env, AGY_CWD: env.AGY_CWD || workCwd });
+  const cliProbe = new CliProbe(config);
+
+  let activeModel = parsed.model || config.defaultModel || '';
+  let activeEffort = parsed.effort || config.defaultEffort || '';
+  let activePermissionMode = parsed.permissionMode || config.defaultPermissionMode || 'default';
+  let activeJsonSchema = parsed.jsonSchema || '';
+  let activeResumeId = parsed.noSessionPersistence ? '' : parsed.resume || '';
+  let activeMcpServers = await loadMcpServersArg(parsed.mcpConfig);
+  let systemPromptText = '';
+  let appendSystemPromptText = '';
+  let systemPromptDelivered = false;
+  let lastContextTokens = 0;
+  let activeChild = null;
+  let interruptRequested = false;
+
+  const writeJsonLine = (obj) => {
+    stdout.write(JSON.stringify(obj) + '\n');
+  };
+
+  async function executeTurn(userText) {
+    const startedAt = Date.now();
+    interruptRequested = false;
+    const fallbackSessionId = activeResumeId || parsed.sessionId || randomUUID();
+    let emittedInit = false;
+    let toolsFromInit = [];
+
+    const emitInitIfNeeded = (sessionId) => {
+      if (emittedInit) return;
+      emittedInit = true;
+      writeJsonLine({
+        type: 'system',
+        subtype: 'init',
+        session_id: sessionId || fallbackSessionId,
+        tools: toolsFromInit
+      });
+    };
+
+    try {
+      await mkdir(workCwd, { recursive: true });
+
+      const { model, effort } = resolveAgyModelAndEffort(activeModel, activeEffort);
+      const permFlags = permissionArgs({ metadata: { permissionMode: activePermissionMode } }, config);
+      const effectivePermissionMode = String(activePermissionMode || 'default').trim().toLowerCase();
+      const allowWriteForTurn = effectivePermissionMode === 'plan' ? false : config.zoteroMcpAllowWrite;
+      const noToolsMode = parsed.hasToolsFlag && parsed.tools === '';
+
+      const promptSections = [];
+      if (!systemPromptDelivered && !activeResumeId) {
+        if (systemPromptText.trim()) promptSections.push(systemPromptText.trim());
+        if (appendSystemPromptText.trim()) promptSections.push(appendSystemPromptText.trim());
+      }
+      promptSections.push(userText);
+      const fullPrompt = promptSections.join('\n\n---\n\n').slice(0, config.maxPrompt);
+
+      let readDirs = [];
+      let settingsFile = '';
+      if (!noToolsMode) {
+        readDirs = await discoverSafeReadDirs({
+          root: workCwd,
+          extraDirs: [...config.extraDirs, ...parsed.addDirs],
+          allowedPdfRoots: config.allowedPdfRoots,
+          instructionTexts: [systemPromptText, appendSystemPromptText, userText]
+        });
+
+        if (Object.keys(activeMcpServers).length > 0) {
+          const preparedMcp = await prepareScopedMcpPlugin({
+            cwd: workCwd,
+            mcpServers: activeMcpServers,
+            allowedTools: parsed.allowedTools,
+            readDirs,
+            allowWrite: allowWriteForTurn
+          });
+          settingsFile = preparedMcp?.settingsFile || '';
+        }
+        if (!settingsFile && readDirs.length > 0) {
+          const written = await writeScopedAgySettingsFile({
+            cwd: workCwd,
+            allowedTools: parsed.allowedTools,
+            readDirs,
+            allowWrite: allowWriteForTurn
+          });
+          settingsFile = written.settingsFile || '';
+        }
+      }
+
+      const args = ['-p', fullPrompt, '--output-format', 'stream-json', '--disable-slash-commands'];
+      if (activeResumeId && !parsed.noSessionPersistence) {
+        args.push('--conversation', activeResumeId);
+      }
+      if (model && model !== 'default') args.push('--model', model);
+      if (effort && effort !== 'default') args.push('--effort', effort);
+      if (activeJsonSchema) args.push('--json-schema', activeJsonSchema);
+      args.push(...permFlags);
+      if (settingsFile && effectivePermissionMode !== 'plan') {
+        args.push('--settings', settingsFile);
+      }
+      for (const dir of readDirs) {
+        args.push('--add-dir', dir);
+      }
+
+      let turnStderr = '';
+      let childError = null;
+      let lastUsage = null;
+
+      const child = spawn(config.binary, [...config.prefixArgs, ...args], {
+        cwd: workCwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+      });
+      activeChild = child;
+
+      child.on('error', (err) => {
+        childError = err;
+      });
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => {
+        turnStderr = (turnStderr + chunk).slice(-config.maxStderr);
+      });
+
+      const mapper = createTurnEventMapper({
+        runId: `agy-shim-${randomUUID()}`,
+        model,
+        onTools: (tools) => {
+          toolsFromInit = tools;
+        },
+        onEvent: (ev) => {
+          const sessionId = mapper.getState().sessionId || ev.sessionId || fallbackSessionId;
+          if (ev.type === 'provider_event' && ev.providerType === 'agy_session') {
+            emitInitIfNeeded(sessionId);
+            return;
+          }
+          if (ev.type === 'message_delta') {
+            emitInitIfNeeded(sessionId);
+            writeJsonLine({
+              type: 'stream_event',
+              session_id: sessionId,
+              event: {
+                type: 'content_block_delta',
+                index: 0,
+                delta: { type: 'text_delta', text: ev.text }
+              }
+            });
+            return;
+          }
+          if (ev.type === 'tool_call') {
+            emitInitIfNeeded(sessionId);
+            writeJsonLine({
+              type: 'assistant',
+              session_id: sessionId,
+              parent_tool_use_id: null,
+              message: {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: ev.callId,
+                    name: ev.name,
+                    input: ev.args ?? {}
+                  }
+                ]
+              }
+            });
+            return;
+          }
+          if (ev.type === 'tool_result') {
+            emitInitIfNeeded(sessionId);
+            writeJsonLine({
+              type: 'user',
+              session_id: sessionId,
+              parent_tool_use_id: null,
+              message: {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: ev.callId,
+                    content: ev.content ?? '',
+                    is_error: ev.ok === false
+                  }
+                ]
+              }
+            });
+            return;
+          }
+          if (ev.type === 'tool_error') {
+            emitInitIfNeeded(sessionId);
+            writeJsonLine({
+              type: 'user',
+              session_id: sessionId,
+              parent_tool_use_id: null,
+              message: {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: ev.callId,
+                    content: ev.error || 'tool_error',
+                    is_error: true
+                  }
+                ]
+              }
+            });
+            return;
+          }
+          if (ev.type === 'usage') {
+            lastUsage = {
+              input_tokens: ev.inputTokens,
+              output_tokens: ev.outputTokens,
+              cache_creation_input_tokens: ev.cacheCreationInputTokens || 0,
+              cache_read_input_tokens: ev.cacheReadInputTokens || 0
+            };
+            lastContextTokens =
+              ev.contextTokens ||
+              ev.inputTokens + ev.outputTokens + (ev.cacheReadInputTokens || 0);
+            writeJsonLine({
+              type: 'stream_event',
+              session_id: sessionId,
+              event: {
+                type: 'message_delta',
+                usage: lastUsage
+              }
+            });
+          }
+        },
+        maxNdjsonLine: config.maxNdjsonLine,
+        extraSecrets: [config.token]
+      });
+
+      let mapperError = null;
+      const rlOut = createInterface({ input: child.stdout, crlfDelay: Infinity });
+      try {
+        for await (const line of rlOut) {
+          try {
+            mapper.processLine(line);
+          } catch (err) {
+            mapperError = err;
+            killProcessTree(child);
+            break;
+          }
+        }
+      } finally {
+        rlOut.close();
+      }
+
+      const exitInfo = await new Promise((resolveExit) => {
+        if (childError || child.exitCode !== null || child.signalCode !== null) {
+          resolveExit({ code: child.exitCode ?? 1, signal: child.signalCode });
+          return;
+        }
+        const finish = (code, signal) => resolveExit({ code, signal });
+        child.once('close', finish);
+        child.once('error', () => finish(child.exitCode ?? 1, child.signalCode));
+      });
+      activeChild = null;
+
+      if (turnStderr.trim()) {
+        stderr.write(redactSensitive(turnStderr, [config.token]));
+      }
+
+      const state = mapper.getState();
+      const sessionId = state.sessionId || fallbackSessionId;
+      emitInitIfNeeded(sessionId);
+
+      const failure =
+        childError ||
+        mapperError ||
+        (interruptRequested ? new Error('interrupted') : null) ||
+        (!state.resultSeen ? new Error('agy exited without a terminal result') : null) ||
+        (exitInfo.code !== 0 ? new Error(`agy process exited with code ${exitInfo.code}`) : null) ||
+        (!state.success ? new Error('agy did not complete successfully') : null);
+
+      if (failure) {
+        const classified = classifyAgyError(failure.message, turnStderr, exitInfo.code ?? 1, [config.token]);
+        writeJsonLine({
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          errors: [{ message: classified.reason }],
+          duration_ms: Date.now() - startedAt,
+          num_turns: 1,
+          session_id: sessionId
+        });
+        return;
+      }
+
+      systemPromptDelivered = true;
+      if (!parsed.noSessionPersistence && state.sessionId) {
+        activeResumeId = state.sessionId;
+      }
+
+      const activeModelKey = model || 'agy';
+      const usageOut = lastUsage || {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0
+      };
+
+      writeJsonLine({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: state.output,
+        duration_ms: Date.now() - startedAt,
+        num_turns: 1,
+        session_id: sessionId,
+        usage: usageOut,
+        modelUsage: {
+          [activeModelKey]: {
+            inputTokens: usageOut.input_tokens,
+            outputTokens: usageOut.output_tokens,
+            cacheCreationInputTokens: usageOut.cache_creation_input_tokens,
+            cacheReadInputTokens: usageOut.cache_read_input_tokens,
+            contextWindow: 200_000
+          }
+        }
+      });
+    } catch (err) {
+      activeChild = null;
+      emitInitIfNeeded(fallbackSessionId);
+      const classified = classifyAgyError(err?.message || err, '', 1, [config.token]);
+      writeJsonLine({
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        errors: [{ message: classified.reason }],
+        duration_ms: Date.now() - startedAt,
+        num_turns: 1,
+        session_id: fallbackSessionId
+      });
+    }
+  }
+
+  async function handleControlRequest(frame) {
+    const requestId = frame.request_id;
+    const req = frame.request && typeof frame.request === 'object' ? frame.request : {};
+    const subtype = String(req.subtype || '');
+
+    try {
+      let response = {};
+      if (subtype === 'initialize') {
+        if (typeof req.systemPrompt === 'string') {
+          systemPromptText = req.systemPrompt;
+        } else if (Array.isArray(req.systemPrompt)) {
+          systemPromptText = req.systemPrompt.filter((s) => typeof s === 'string').join('\n\n');
+        }
+        if (typeof req.appendSystemPrompt === 'string') {
+          appendSystemPromptText = req.appendSystemPrompt;
+        }
+        if (req.jsonSchema && !activeJsonSchema) {
+          activeJsonSchema = typeof req.jsonSchema === 'string' ? req.jsonSchema : JSON.stringify(req.jsonSchema);
+        }
+        let models = [];
+        try {
+          models = await cliProbe.getModels(false);
+        } catch {
+          models = [];
+        }
+        response = { models, commands: [], agents: [], account: null };
+      } else if (subtype === 'mcp_status') {
+        const mcpServers = [];
+        for (const [name, entry] of Object.entries(activeMcpServers)) {
+          if (!entry?.url) continue;
+          const status = await probeZoteroMcp({ url: entry.url, headers: entry.headers || {} });
+          mcpServers.push({
+            name,
+            status: status.connected ? 'connected' : 'failed',
+            ...(status.protocolVersion ? { serverInfo: { protocolVersion: status.protocolVersion } } : {}),
+            ...(status.error ? { error: status.error } : {}),
+            config: { url: entry.url },
+            tools: status.tools
+          });
+        }
+        response = { mcpServers };
+      } else if (subtype === 'mcp_set_servers') {
+        const nextServers = req.servers && typeof req.servers === 'object' ? req.servers : {};
+        activeMcpServers = Object.fromEntries(
+          Object.entries(nextServers).filter(([, cfg]) => cfg && typeof cfg === 'object' && (cfg.url || cfg.serverUrl))
+        );
+        response = { added: Object.keys(activeMcpServers), removed: [], errors: {} };
+      } else if (subtype === 'set_model') {
+        activeModel = String(req.model || '').trim();
+        response = {};
+      } else if (subtype === 'set_permission_mode') {
+        activePermissionMode = String(req.mode || 'default').trim();
+        response = {};
+      } else if (subtype === 'get_context_usage') {
+        response = { totalTokens: lastContextTokens, maxTokens: 200_000 };
+      } else if (subtype === 'interrupt') {
+        interruptRequested = true;
+        if (activeChild) killProcessTree(activeChild);
+        response = {};
+      }
+
+      writeJsonLine({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: requestId,
+          response
+        }
+      });
+    } catch (err) {
+      writeJsonLine({
+        type: 'control_response',
+        response: {
+          subtype: 'error',
+          request_id: requestId,
+          error: redactSensitive(err?.message || err, [config.token])
+        }
+      });
+    }
+  }
+
+  // Fallback for one-shot plaintext/prompt invocation if stdin isn't stream-json
+  if (parsed.inputFormat !== 'stream-json') {
+    const prompt = parsed.promptParts.join(' ').trim();
+    if (prompt) {
+      await executeTurn(prompt);
+    }
+    return 0;
+  }
+
+  let turnChain = Promise.resolve();
+  const rlIn = createInterface({ input: stdin, crlfDelay: Infinity });
+
+  rlIn.on('line', (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let frame;
+    try {
+      frame = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+
+    if (frame?.type === 'control_request') {
+      void handleControlRequest(frame);
+      return;
+    }
+
+    if (frame?.type === 'user') {
+      const userText = extractSdkUserText(frame);
+      if (!userText.trim()) {
+        // SDK metadata probes (supportedModels / supportedCommands / mcpServerStatus) pass prompt: ""
+        return;
+      }
+      turnChain = turnChain.then(() => executeTurn(userText)).catch((err) => {
+        stderr.write(redactSensitive(err?.message || err, [config.token]) + '\n');
+      });
+    }
+  });
+
+  await new Promise((resolveDone) => {
+    rlIn.once('close', () => {
+      void turnChain.finally(resolveDone);
+    });
+  });
+
+  return 0;
+}

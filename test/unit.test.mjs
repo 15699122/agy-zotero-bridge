@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inferModelCapabilities, parseModelsStdout, resolveAgyModelAndEffort, splitModelVariant } from '../src/agy/cli-probe.mjs';
 import { normalizeCumulativeUsage, SessionProcessPool } from '../src/agy/process-pool.mjs';
-import { createConfig } from '../src/config.mjs';
+import { ensureWindowsClaudeCmdShim, extractSdkUserText, parseClaudeShimArgs } from '../src/claude-sdk/cli-shim.mjs';
+import { createConfig, parseBridgeCliArgs } from '../src/config.mjs';
 import { buildTurnPrompt, collectLocalDocuments, sanitizeLocalPdfText, buildLocalPdfReplacements, validateLocalDocuments } from '../src/context/prompt-builder.mjs';
 import { buildScopedAgySettings, buildScopedZoteroRulesMarkdown, classifyToolMetadata, prepareScopedMcpPlugin } from '../src/mcp/zotero-mcp.mjs';
 import { forwardJsonRpcMessage } from '../src/mcp/stdio-http-proxy.mjs';
@@ -738,4 +739,83 @@ test('writeEnabled defaults to true across config, settings, and stdio-http-prox
     rwList[0].result.tools.map((t) => t.name),
     ['library_search', 'note_write']
   );
+});
+
+test('parseClaudeShimArgs, extractSdkUserText, ensureWindowsClaudeCmdShim, and managed bridge CLI flags', async () => {
+  const parsed = parseClaudeShimArgs([
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '--input-format',
+    'stream-json',
+    '--model',
+    'gemini-3.8-flash',
+    '--effort',
+    'medium',
+    '--resume=conv-xyz',
+    '--setting-sources=user,project',
+    '--add-dir',
+    'C:\\Papers',
+    '--tools',
+    '',
+    '--allowedTools',
+    'mcp__srv__library_search,WebSearch'
+  ]);
+  assert.equal(parsed.outputFormat, 'stream-json');
+  assert.equal(parsed.inputFormat, 'stream-json');
+  assert.equal(parsed.model, 'gemini-3.8-flash');
+  assert.equal(parsed.effort, 'medium');
+  assert.equal(parsed.resume, 'conv-xyz');
+  assert.deepEqual(parsed.settingSources, ['user', 'project']);
+  assert.deepEqual(parsed.addDirs, ['C:\\Papers']);
+  assert.equal(parsed.hasToolsFlag, true);
+  assert.equal(parsed.tools, '');
+  assert.deepEqual(parsed.allowedTools, ['mcp__srv__library_search', 'WebSearch']);
+
+  assert.equal(extractSdkUserText({ message: { content: 'plain text' } }), 'plain text');
+  assert.equal(
+    extractSdkUserText({ message: { content: [{ type: 'text', text: 'line1' }, { type: 'text', text: 'line2' }] } }),
+    'line1\nline2'
+  );
+
+  const tmpRepo = await mkdtemp(join(tmpdir(), 'agy-cmd-shim-test-'));
+  try {
+    const pkgDir = await ensureWindowsClaudeCmdShim(tmpRepo);
+    const cliJs = await readFile(join(pkgDir, 'cli.js'), 'utf8');
+    assert.match(cliJs, /runClaudeCodeAgyShim/);
+
+    const cliFlags = parseBridgeCliArgs([
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '0',
+      '--zotero-root',
+      tmpRepo,
+      '--managed-by',
+      'llm-for-zotero',
+      '--exit-on-stdin-close',
+      '1'
+    ]);
+    assert.equal(cliFlags.port, '0');
+    assert.equal(cliFlags.managedBy, 'llm-for-zotero');
+    const cfg = createConfig({ ADAPTER_AUTH_TOKEN: 'secret-tok' }, [
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '0',
+      '--zotero-root',
+      tmpRepo,
+      '--managed-by',
+      'llm-for-zotero',
+      '--exit-on-stdin-close',
+      '1'
+    ]);
+    assert.equal(cfg.port, 0);
+    assert.equal(cfg.token, 'secret-tok');
+    assert.equal(cfg.managedBy, 'llm-for-zotero');
+    assert.equal(cfg.exitOnStdinClose, true);
+    assert.ok(cfg.root.endsWith('agent-runtime'));
+  } finally {
+    await rm(tmpRepo, { recursive: true, force: true });
+  }
 });

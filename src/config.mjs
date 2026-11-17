@@ -42,32 +42,130 @@ export function resolveAgyBinary(env = process.env) {
   return 'agy';
 }
 
+function expandHomePath(rawPath) {
+  const raw = String(rawPath || '').trim();
+  if (!raw) return '';
+  if (raw === '~') return resolve(homedir());
+  if (raw.startsWith('~/') || raw.startsWith('~\\')) return resolve(homedir(), raw.slice(2));
+  return resolve(raw);
+}
+
+function parseDirectoryCsv(raw) {
+  if (!raw || !String(raw).trim()) return [];
+  return String(raw)
+    .split(',')
+    .map((entry) => expandHomePath(entry))
+    .filter(Boolean);
+}
+
+function parseBoolFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  const norm = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(norm)) return true;
+  if (['0', 'false', 'no', 'off'].includes(norm)) return false;
+  return fallback;
+}
+
 /**
- * Creates validated runtime configuration from environment variables.
+ * Parses managed-bridge CLI flags (`--host`, `--port`, `--zotero-root`, etc.).
  */
-export function createConfig(env = process.env) {
-  const host = (env.AGY_BRIDGE_HOST || '127.0.0.1').trim();
+export function parseBridgeCliArgs(argv = []) {
+  const out = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const raw = String(argv[i] ?? '');
+    if (!raw.startsWith('--')) continue;
+    const eqIdx = raw.indexOf('=');
+    const flag = eqIdx > 0 ? raw.slice(0, eqIdx) : raw;
+    const inlineVal = eqIdx > 0 ? raw.slice(eqIdx + 1) : undefined;
+
+    const takeVal = () => {
+      if (inlineVal !== undefined) return inlineVal;
+      if (i + 1 < argv.length && !String(argv[i + 1]).startsWith('--')) {
+        i += 1;
+        return String(argv[i] ?? '');
+      }
+      return undefined;
+    };
+
+    switch (flag) {
+      case '--host':
+        out.host = takeVal();
+        break;
+      case '--port':
+        out.port = takeVal();
+        break;
+      case '--zotero-root':
+        out.zoteroRoot = takeVal();
+        break;
+      case '--runtime-cwd':
+        out.runtimeCwd = takeVal();
+        break;
+      case '--state-dir':
+        out.stateDir = takeVal();
+        break;
+      case '--additional-directories':
+        out.additionalDirectories = takeVal();
+        break;
+      case '--managed-by':
+        out.managedBy = takeVal();
+        break;
+      case '--exit-on-stdin-close':
+        out.exitOnStdinClose = takeVal() ?? '1';
+        break;
+      default:
+        // Consume value for compatible managed flags (e.g. --claude-path, --log-file, --setting-sources)
+        takeVal();
+        break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Creates validated runtime configuration from environment variables and CLI flags.
+ */
+export function createConfig(env = process.env, argv = []) {
+  const cli = Array.isArray(argv) && argv.length > 0 ? parseBridgeCliArgs(argv) : {};
+
+  const host = (cli.host || env.AGY_BRIDGE_HOST || env.ADAPTER_HOST || '127.0.0.1').trim();
   const allowRemote = env.AGY_ALLOW_REMOTE === '1';
   if (!isLoopbackHost(host) && !allowRemote) {
     throw new Error(`Refusing to bind to non-loopback host "${host}" without AGY_ALLOW_REMOTE=1`);
   }
 
-  const portRaw = env.AGY_BRIDGE_PORT ?? '8765';
+  const portRaw = cli.port ?? env.AGY_BRIDGE_PORT ?? env.ADAPTER_PORT ?? '8765';
   const port = Number(portRaw);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error(`Invalid AGY_BRIDGE_PORT: ${portRaw}`);
   }
 
+  const zoteroRootRaw = String(cli.zoteroRoot || env.ZOTERO_ROOT || '').trim();
+  const zoteroRoot = zoteroRootRaw ? expandHomePath(zoteroRootRaw) : '';
+
   const binary = resolveAgyBinary(env);
   const prefixArgs = parseStringArrayEnv(env.AGY_PREFIX_ARGS_JSON, 'AGY_PREFIX_ARGS_JSON');
-  const extraDirs = parseStringArrayEnv(env.AGY_EXTRA_DIRS_JSON, 'AGY_EXTRA_DIRS_JSON').map((d) => resolve(d));
-  const allowedPdfRoots = parseStringArrayEnv(env.AGY_ALLOWED_PDF_ROOTS_JSON, 'AGY_ALLOWED_PDF_ROOTS_JSON').map((d) => resolve(d));
+  const cliExtraDirs = parseDirectoryCsv(cli.additionalDirectories || env.ADAPTER_ADDITIONAL_DIRECTORIES);
+  const envExtraDirs = parseStringArrayEnv(env.AGY_EXTRA_DIRS_JSON, 'AGY_EXTRA_DIRS_JSON').map((d) => expandHomePath(d));
+  const extraDirs = [...new Set([...(zoteroRoot ? [zoteroRoot] : []), ...envExtraDirs, ...cliExtraDirs])];
+  const allowedPdfRoots = parseStringArrayEnv(env.AGY_ALLOWED_PDF_ROOTS_JSON, 'AGY_ALLOWED_PDF_ROOTS_JSON').map((d) =>
+    resolve(d)
+  );
 
-  const root = resolve(env.AGY_CWD || process.cwd());
-  const stateFile = resolve(env.AGY_BRIDGE_STATE || join(homedir(), '.agy-zotero-bridge', 'sessions.json'));
+  const root = expandHomePath(
+    cli.runtimeCwd || env.AGY_CWD || env.ADAPTER_RUNTIME_CWD || (zoteroRoot ? join(zoteroRoot, 'agent-runtime') : process.cwd())
+  );
+  const stateDirRaw = String(
+    cli.stateDir || env.ADAPTER_STATE_DIR || (zoteroRoot ? join(zoteroRoot, 'agent-state') : '')
+  ).trim();
+  const stateFile = expandHomePath(
+    env.AGY_BRIDGE_STATE || (stateDirRaw ? join(stateDirRaw, 'sessions.json') : join(homedir(), '.agy-zotero-bridge', 'sessions.json'))
+  );
 
   return {
     bridgeVersion: BRIDGE_VERSION,
+    managedBy: String(cli.managedBy || env.ADAPTER_MANAGED_BY || '').trim(),
+    exitOnStdinClose: parseBoolFlag(cli.exitOnStdinClose ?? env.ADAPTER_EXIT_ON_STDIN_CLOSE, false),
     host,
     port,
     allowRemote,
@@ -75,7 +173,7 @@ export function createConfig(env = process.env) {
     prefixArgs,
     root,
     stateFile,
-    token: env.AGY_BRIDGE_TOKEN || '',
+    token: env.AGY_BRIDGE_TOKEN || env.ADAPTER_AUTH_TOKEN || '',
     allowYolo: env.AGY_ALLOW_YOLO === '1',
     defaultModel: env.AGY_DEFAULT_MODEL || '',
     defaultEffort: env.AGY_DEFAULT_EFFORT || '',
