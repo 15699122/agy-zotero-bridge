@@ -11,6 +11,7 @@ import {
 import { prepareScopedMcpPlugin, writeScopedAgySettingsFile } from '../mcp/zotero-mcp.mjs';
 import { classifyAgyError, createTurnEventMapper } from '../protocol/event-mapper.mjs';
 import { redactSensitive } from '../security/redact.mjs';
+import { resolveAgyModelAndEffort } from './cli-probe.mjs';
 import { normalizeCumulativeUsage } from './process-pool.mjs';
 
 const record = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
@@ -477,8 +478,9 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
     const timeoutMs = clampTimeout(metadata.timeoutMs ?? b.timeoutMs, config.defaultTurnTimeoutMs);
     const printTimeoutFlag = `${Math.max(1, Math.ceil(timeoutMs / 1000))}s`;
 
-    const model = str(metadata.model || config.defaultModel);
-    const effort = str(metadata.effort || config.defaultEffort).toLowerCase();
+    const rawModel = str(metadata.model || config.defaultModel);
+    const rawEffort = str(metadata.effort || config.defaultEffort);
+    const { model, effort } = resolveAgyModelAndEffort(rawModel, rawEffort);
 
     if (controller.signal.aborted) {
       throw new Error('cancelled');
@@ -798,8 +800,9 @@ export async function runStructuredCompletion({ body, res, config }) {
 
   const schema = extractSchema(b, config);
   const timeoutMs = clampTimeout(b.timeoutMs ?? record(b.metadata).timeoutMs, config.defaultStructuredTimeoutMs);
-  const model = str(b.model || record(b.metadata).model || config.defaultModel);
-  const effort = str(b.effort || record(b.metadata).effort || config.defaultEffort).toLowerCase();
+  const rawModel = str(b.model || record(b.metadata).model || config.defaultModel);
+  const rawEffort = str(b.effort || record(b.metadata).effort || config.defaultEffort);
+  const { model, effort } = resolveAgyModelAndEffort(rawModel, rawEffort);
   const perm = permissionArgs(
     { metadata: { permissionMode: str(b.permissionMode || record(b.metadata).permissionMode || 'default') } },
     config

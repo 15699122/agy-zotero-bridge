@@ -153,6 +153,15 @@ function handlePrompt(prompt, turnNumber = 1, cumUsage = { inTok: 0, outTok: 0, 
     const payload = JSON.stringify({ hasSettingsFlag: settingsIdx >= 0, settingsPath });
     emit({ event: 'step_update', step_update: { step_index: 3, step_type: 'agent_response', state: 'DONE', text: payload } });
     emit({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: payload, usage: { input_tokens: 4, output_tokens: 4, total_tokens: 8 } } });
+  } else if (prompt.includes('MOCK_ECHO_MODEL_EFFORT')) {
+    const modelIdx = ix('--model');
+    const effortIdx = ix('--effort');
+    const payload = JSON.stringify({
+      model: modelIdx >= 0 ? args[modelIdx + 1] || null : null,
+      effort: effortIdx >= 0 ? args[effortIdx + 1] || null : null
+    });
+    emit({ event: 'step_update', step_update: { step_index: 3, step_type: 'agent_response', state: 'DONE', text: payload } });
+    emit({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: payload, usage: { input_tokens: 4, output_tokens: 4, total_tokens: 8 } } });
   } else if (prompt.includes('MOCK_ECHO_RAW_PDF')) {
     const m = /"absolutePath":"((?:[^"\\]|\\.)*)"/.exec(prompt);
     const echoed = m ? JSON.parse(`"${m[1]}"`) : 'UNKNOWN_PATH';

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { inferModelCapabilities, parseModelsStdout } from '../src/agy/cli-probe.mjs';
+import { inferModelCapabilities, parseModelsStdout, resolveAgyModelAndEffort, splitModelVariant } from '../src/agy/cli-probe.mjs';
 import { normalizeCumulativeUsage, SessionProcessPool } from '../src/agy/process-pool.mjs';
 import { createConfig } from '../src/config.mjs';
 import { buildTurnPrompt, collectLocalDocuments, sanitizeLocalPdfText, buildLocalPdfReplacements, validateLocalDocuments } from '../src/context/prompt-builder.mjs';
@@ -18,28 +18,85 @@ import {
   REAL_AGY_1_5_9_MODELS_TEXT_STDOUT
 } from './fixtures/ndjson-samples.mjs';
 
-test('parseModelsStdout handles real agy 1.5.9 JSON output with leading status banner', () => {
+test('parseModelsStdout groups real agy 1.5.9 JSON variants into base models with effort levels', () => {
   const infos = parseModelsStdout(REAL_AGY_1_5_9_MODELS_JSON_STDOUT);
-  assert.equal(infos.length, 18);
+  assert.deepEqual(
+    infos.map((m) => m.value),
+    [
+      'gemini-4-argon',
+      'gemini-4-hydrogen',
+      'gemini-pro-orchestrator-g1-pro',
+      'gemini-3.8-flash',
+      'claude-opus-5-5',
+      'claude-sonnet-5-5',
+      'gpt-oss-120b'
+    ]
+  );
   assert.ok(!infos.some((m) => m.value.toLowerCase() === 'fetching'));
-  assert.equal(infos[0].value, 'gemini-4-argon-medium');
-  assert.equal(infos[0].displayName, 'Gemini 4 Argon (Medium)');
-  const hydrogen = infos.find((m) => m.value === 'gemini-4-hydrogen-xhigh');
+  assert.equal(infos[0].value, 'gemini-4-argon');
+  assert.equal(infos[0].displayName, 'Gemini 4 Argon');
+  assert.deepEqual(infos[0].supportedEffortLevels, ['low', 'medium', 'high']);
+
+  const hydrogen = infos.find((m) => m.value === 'gemini-4-hydrogen');
+  assert.equal(hydrogen.displayName, 'Gemini 4 Hydrogen');
   assert.ok(hydrogen.supportedEfforts.includes('xhigh'));
   assert.equal(hydrogen.supportsEffort, true);
   assert.deepEqual(hydrogen.supportedEffortLevels, ['low', 'medium', 'high', 'xhigh']);
+
   const orch = infos.find((m) => m.value === 'gemini-pro-orchestrator-g1-pro');
+  assert.equal(orch.displayName, 'Orchestrator (Argon)');
   assert.deepEqual(orch.supportedEfforts, ['default']);
   assert.equal(orch.supportsEffort, false);
   assert.deepEqual(orch.supportedEffortLevels, []);
+
+  const gpt = infos.find((m) => m.value === 'gpt-oss-120b');
+  assert.equal(gpt.displayName, 'GPT-OSS 120B');
+  assert.equal(gpt.supportsEffort, true);
+  assert.deepEqual(gpt.supportedEffortLevels, ['medium']);
 });
 
-test('parseModelsStdout handles real agy 1.5.9 plaintext TSV output without bogus Fetching entry', () => {
+test('parseModelsStdout groups real agy 1.5.9 plaintext TSV variants without bogus Fetching entry', () => {
   const infos = parseModelsStdout(REAL_AGY_1_5_9_MODELS_TEXT_STDOUT);
-  assert.equal(infos.length, 18);
+  assert.equal(infos.length, 7);
   assert.ok(!infos.some((m) => m.value.toLowerCase() === 'fetching'));
-  assert.equal(infos.at(-1).value, 'gpt-oss-120b-medium');
-  assert.deepEqual(infos.at(-1).supportedEfforts, ['default']);
+  assert.equal(infos.at(-1).value, 'gpt-oss-120b');
+  assert.equal(infos.at(-1).displayName, 'GPT-OSS 120B');
+  assert.deepEqual(infos.at(-1).supportedEfforts, ['default', 'medium']);
+});
+
+test('splitModelVariant and resolveAgyModelAndEffort normalize base models and effort levels', () => {
+  assert.deepEqual(splitModelVariant('gemini-3.8-flash-low', 'Gemini 3.8 Flash (Low)'), {
+    baseId: 'gemini-3.8-flash',
+    baseLabel: 'Gemini 3.8 Flash',
+    effort: 'low',
+    rawId: 'gemini-3.8-flash-low'
+  });
+  assert.deepEqual(splitModelVariant('gemini-4-hydrogen-xhigh', 'gemini-4-hydrogen-xhigh'), {
+    baseId: 'gemini-4-hydrogen',
+    baseLabel: 'gemini-4-hydrogen',
+    effort: 'xhigh',
+    rawId: 'gemini-4-hydrogen-xhigh'
+  });
+  assert.deepEqual(splitModelVariant('gemini-pro-orchestrator-g1-pro', 'Orchestrator (Argon)'), {
+    baseId: 'gemini-pro-orchestrator-g1-pro',
+    baseLabel: 'Orchestrator (Argon)',
+    effort: '',
+    rawId: 'gemini-pro-orchestrator-g1-pro'
+  });
+
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-3.8-flash', 'low'), { model: 'gemini-3.8-flash', effort: 'low' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-3.8-flash', 'auto'), { model: 'gemini-3.8-flash', effort: '' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-3.8-flash-low', 'high'), { model: 'gemini-3.8-flash', effort: 'high' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-3.8-flash-low', 'auto'), { model: 'gemini-3.8-flash', effort: 'low' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-3.8-flash', 'max'), { model: 'gemini-3.8-flash', effort: 'high' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-hydrogen', 'xhigh'), { model: 'gemini-4-hydrogen', effort: 'xhigh' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-hydrogen', 'max'), { model: 'gemini-4-hydrogen', effort: 'xhigh' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-pro-orchestrator-g1-pro', 'high'), { model: 'gemini-pro-orchestrator-g1-pro', effort: '' });
+  assert.deepEqual(resolveAgyModelAndEffort('gpt-oss-120b', 'high'), { model: 'gpt-oss-120b', effort: 'medium' });
+  assert.deepEqual(resolveAgyModelAndEffort('gpt-oss-120b-medium', 'auto'), { model: 'gpt-oss-120b', effort: 'medium' });
+  assert.deepEqual(resolveAgyModelAndEffort('custom-model', 'auto'), { model: 'custom-model', effort: '' });
+  assert.deepEqual(resolveAgyModelAndEffort('custom-model', 'high'), { model: 'custom-model', effort: 'high' });
+  assert.deepEqual(resolveAgyModelAndEffort('default', 'auto'), { model: '', effort: '' });
 });
 
 test('inferModelCapabilities stays conservative for unknown models', () => {

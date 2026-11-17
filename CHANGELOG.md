@@ -2,13 +2,16 @@
 
 ## v1.0.0 (2026-11-17)
 
+### Fixed (Base Model & Thinking Level Separation)
+- **Grouped Model Catalog & `(model, effort)` Normalization (`src/agy/cli-probe.mjs`, `src/agy/process-runner.mjs`)**: Added `splitModelVariant` and `resolveAgyModelAndEffort` so `agy models` thinking-level variants (e.g. `gemini-3.8-flash-low/medium/high`, `gemini-4-hydrogen-xhigh`, `claude-opus-5-5-*`, `claude-sonnet-5-5-*`, `gpt-oss-120b-medium`) are grouped into clean base models with `supportedEffortLevels` in `GET /models`, letting Zotero's `默认模型` dropdown select the model and `默认推理` select the Thinking Level independently. `GET /efforts`, `runTurnStream`, and `runStructuredCompletion` normalize both base IDs and legacy suffixed IDs, omit `--effort` when Zotero sends `'auto'`/`'default'`, clamp unsupported `xhigh`/`max` requests safely, and preserve fixed-effort models (`gemini-pro-orchestrator-g1-pro`, `gpt-oss-120b`).
+
 ### Changed (User-Requested Direct Zotero Library Modification)
 - **Direct Zotero Write Access Enabled by Default (`writeEnabled: true`)**: Updated `createConfig`, `buildScopedAgySettings`, `buildScopedZoteroRulesMarkdown`, `prepareScopedMcpPlugin`, `writeScopedAgySettingsFile`, `stdio-http-proxy.mjs`, and `runTurnStream` so Zotero MCP write tools (`note_write`, `note_write_batch`, `library_update`, `library_import`, `library_delete`, `annotate_pdf`, `file_io`, `undo`, `zotero_script`, etc.) are permitted directly by default with post-write readback verification rules. Strict read-only mode remains available via `AGY_ZOTERO_MCP_ALLOW_WRITE=0` or `permissionMode: "plan"`.
 
 ### Added (M4 Persistent Pool & Live M3 Confirmation)
 - **Live Zotero Manual Verification**: User confirmed single-paper close reading / experiment analysis and cross-paper comparison passed live testing on Zotero `10.0.8` + `llm-for-zotero v3.9.19`.
 - **Full M4 Persistent `stdin stream-json` Process Reuse (`src/agy/process-runner.mjs`)**: Verified `agy.exe 1.5.9` `--input-format stream-json --output-format stream-json --print=` interface; wired warm child creation, per-turn signature validation, `{"event":"user","message":{"content":...}}` streaming, cumulative usage delta normalization (`normalizeCumulativeUsage`), and immediate error/abort process-tree cleanup when `AGY_PROCESS_POOL=1`.
-- **Expanded Tests (`test/mock-agy.mjs`, `test/unit.test.mjs`, `test/bridge.test.mjs`)**: Total **45 / 45** passing tests (`24` unit tests + `21` integration tests), verifying default `writeEnabled: true`, `AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out, persistent PID reuse across pooled turns, and `/invalidate-session` respawn.
+- **Expanded Tests (`test/mock-agy.mjs`, `test/unit.test.mjs`, `test/bridge.test.mjs`)**: Total **47 / 47** passing tests (`25` unit tests + `22` integration tests), verifying default `writeEnabled: true`, `AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out, persistent PID reuse across pooled turns, `/invalidate-session` respawn, and grouped base-model / `(model, effort)` normalization.
 
 ## v0.3.0 (2026-11-17)
 

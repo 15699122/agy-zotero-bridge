@@ -9,8 +9,8 @@
 
 | Suite / Command | Scope | Pass / Total | Notes |
 | --- | --- | --- | --- |
-| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 24 / 24 | Runs offline inside sandbox (real `agy 1.5.9` model parsing, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, `normalizeCumulativeUsage` & `SessionProcessPool`) |
-| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/unit.test.mjs`) | 45 / 45 | Original 10 baseline integration tests + 11 new HTTP integration tests (including M4 pooled PID reuse) + 24 unit tests |
+| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 25 / 25 | Runs offline inside sandbox (real `agy 1.5.9` variant-to-base-model grouping, `splitModelVariant` & `resolveAgyModelAndEffort`, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, `normalizeCumulativeUsage` & `SessionProcessPool`) |
+| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/unit.test.mjs`) | 47 / 47 | Original 10 baseline integration tests + 12 new HTTP integration tests (including M4 pooled PID reuse & `(model, effort)` normalization) + 25 unit tests |
 
 ### Original 10 Baseline Integration Tests (`test/bridge.test.mjs`)
 1. `health and model discovery match plugin contract` — PASS
@@ -24,7 +24,7 @@
 9. `safe mode allows a later request after yolo refusal for same session` — PASS
 10. `client disconnect cancels process and releases scoped conversation` — PASS
 
-### New v0.2.0 / v0.3.0 Integration Tests (`test/bridge.test.mjs`)
+### New v0.2.0 – v1.0.0 Integration Tests (`test/bridge.test.mjs`)
 11. `healthz separates installation and authentication status cleanly` — PASS
 12. `efforts and tools endpoints reflect conservative defaults and accurate tool mutability` — PASS
 13. `structured-completion supports text, JSON schema, fenced JSON, invalid JSON rejection, and stays stateless` — PASS
@@ -36,12 +36,13 @@
 19. `healthz advertises local_pdf_paths and run-turn validates and redacts localDocuments paths` — PASS
 20. `mcp-servers handles 401 before turn and captures Bearer token + tools during Zotero run-turn` — PASS
 21. `runtime-retention, invalidate-session, and invalidate-all-hot-runtimes respect pool opt-in` — PASS
+22. `run-turn and efforts normalize base models, legacy suffixed variants, and auto effort cleanly` — PASS
 
 ## 2. Live E2E Observations (`agy.exe 1.5.9` + Zotero `10.0.8` + `llm-for-zotero v3.9.19`)
 
 Verified against the user's live Windows machine:
 
-- `agy.exe --version` → `1.5.9`; `CliProbe.getModels(true)` → Parsed **18** real models cleanly despite `"Fetching available models..."` banner.
+- `agy.exe --version` → `1.5.9`; `CliProbe.getModels(true)` → Parsed **18** raw CLI variants grouped into **7** base models cleanly despite `"Fetching available models..."` banner, and `agy.exe -p "Reply OK" --model gemini-3.8-flash --effort low --output-format json --disable-slash-commands` returned `SUCCESS`.
 - **CLI Smoke & Flag Validation (`agy.exe 1.5.9`)**:
   - `POST /structured-completion` with JSON Schema → returned `{"ok":true,"text":"{\"bridge\":\"agy\",\"status\":\"ok\"}","data":{"bridge":"agy","status":"ok"},"usage":{"inputTokens":10567,"outputTokens":106,...}}`
   - `GET /tools` after real `agy.exe` turn → returned all **47** real `agy.exe` tools from `init.tools`.

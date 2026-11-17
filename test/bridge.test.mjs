@@ -744,3 +744,22 @@ test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes res
     await rm(d3, { recursive: true, force: true });
   }
 });
+
+test('run-turn and efforts normalize base models, legacy suffixed variants, and auto effort cleanly', async () => {
+  const eBase = await (await fetch(base + '/efforts?model=gemini-3.8-flash')).json();
+  assert.equal(eBase.model, 'gemini-3.8-flash');
+  assert.deepEqual(eBase.efforts, ['default', 'low', 'medium', 'high']);
+
+  const eLegacy = await (await fetch(base + '/efforts?model=gemini-3.8-flash-low')).json();
+  assert.equal(eLegacy.model, 'gemini-3.8-flash');
+  assert.deepEqual(eLegacy.efforts, ['default', 'low', 'medium', 'high']);
+
+  const f1 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-1', { model: 'gemini-3.8-flash', effort: 'low' });
+  assert.deepEqual(JSON.parse(f1.at(-1).outcome.text), { model: 'gemini-3.8-flash', effort: 'low' });
+
+  const f2 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-2', { model: 'gemini-3.8-flash-low', effort: 'high' });
+  assert.deepEqual(JSON.parse(f2.at(-1).outcome.text), { model: 'gemini-3.8-flash', effort: 'high' });
+
+  const f3 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-3', { model: 'gemini-3.8-flash', effort: 'auto' });
+  assert.deepEqual(JSON.parse(f3.at(-1).outcome.text), { model: 'gemini-3.8-flash', effort: null });
+});
