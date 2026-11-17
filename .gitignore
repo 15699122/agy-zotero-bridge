@@ -1,0 +1,8 @@
+node_modules/
+.agy-sessions/
+.agents/
+sessions.json
+*.tmp
+*.log
+.env
+.env.*
