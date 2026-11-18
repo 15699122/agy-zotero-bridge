@@ -291,7 +291,9 @@ async function runPooledTurn({
       if (err && typeof err === 'object') {
         err.stderr = turnStderr;
         err.exitCode = runtime.exitInfo?.code ?? runtime.child.exitCode ?? null;
-        err.settledToolCount = mapper.getState().settledToolCount;
+        const mapperState = mapper.getState();
+        err.settledToolCount = mapperState.settledToolCount;
+        err.mapperState = mapperState;
       }
       rejectTurn(err);
     };
@@ -611,6 +613,24 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
           processPool.invalidate(key, { keepRetained: true });
           child = null;
 
+          const recoverableState = err?.mapperState;
+          const isManualCancel = controller.signal.aborted && !timedOut;
+          if (
+            !isManualCancel &&
+            recoverableState?.settledNoteWrites > 0 &&
+            recoverableState?.synthesizedOutput
+          ) {
+            const recovered = recoverableState.output.trim()
+              ? recoverableState.output
+              : recoverableState.synthesizedOutput;
+            if (!recoverableState.output.trim()) {
+              emitSanitizedEvent({ type: 'message_delta', text: recovered });
+            }
+            emitSanitizedEvent({ type: 'final', text: recovered });
+            state = { ...recoverableState, output: recovered, success: true };
+            break;
+          }
+
           if (timedOut || controller.signal.aborted) {
             throw err;
           }
@@ -729,6 +749,25 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
           ? await exitTracker.awaitBounded()
           : await exitTracker.awaitNormal();
 
+        const attemptState = mapper.getState();
+        const isManualCancel = controller.signal.aborted && !timedOut;
+        if (
+          (timedOut || childError || mapperError || !attemptState.resultSeen || exitInfo.code !== 0 || !attemptState.success) &&
+          !isManualCancel &&
+          attemptState.settledNoteWrites > 0 &&
+          attemptState.synthesizedOutput
+        ) {
+          const recovered = attemptState.output.trim()
+            ? attemptState.output
+            : attemptState.synthesizedOutput;
+          if (!attemptState.output.trim()) {
+            emitSanitizedEvent({ type: 'message_delta', text: recovered });
+          }
+          emitSanitizedEvent({ type: 'final', text: recovered });
+          state = { ...attemptState, output: recovered, success: true };
+          break;
+        }
+
         if (childError) throw childError;
         if (timedOut) {
           const err = new Error(`agy turn timed out after ${timeoutMs}ms`);
@@ -741,7 +780,6 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
           throw err;
         }
 
-        const attemptState = mapper.getState();
         let attemptErr = mapperError;
         if (!attemptErr && !attemptState.resultSeen) {
           const snippet = stderr ? `: ${stderr.slice(-1200)}` : '';

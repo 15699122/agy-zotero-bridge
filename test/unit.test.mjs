@@ -24,14 +24,14 @@ import {
   validateImageBuffer,
   validateLocalDocuments
 } from '../src/context/prompt-builder.mjs';
-import { buildScopedAgySettings, buildScopedZoteroRulesMarkdown, classifyToolMetadata, prepareScopedMcpPlugin } from '../src/mcp/zotero-mcp.mjs';
-import { forwardJsonRpcMessage } from '../src/mcp/stdio-http-proxy.mjs';
+import { buildScopedAgySettings, buildScopedZoteroRulesMarkdown, classifyToolMetadata, prepareScopedMcpPlugin, toShortMcpServerAlias } from '../src/mcp/zotero-mcp.mjs';
+import { compactMcpToolCallResponse, forwardJsonRpcMessage } from '../src/mcp/stdio-http-proxy.mjs';
 import {
   computeLocalSemanticEmbedding,
   cosineSimilarity,
   EmbeddingService
 } from '../src/embedding/embedding-service.mjs';
-import { classifyAgyError, createTurnEventMapper } from '../src/protocol/event-mapper.mjs';
+import { classifyAgyError, createTurnEventMapper, normalizeAgyToolArgs } from '../src/protocol/event-mapper.mjs';
 import { redactSensitive, validateLocalFilePath } from '../src/security/redact.mjs';
 import { SessionStore } from '../src/session/session-store.mjs';
 import {
@@ -1091,4 +1091,152 @@ test('M7-02 local semantic embedding L2 norm, bilingual similarity, disk cache, 
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('stdio-http-proxy compacts bloated note_write / library_read responses, shortens MCP aliases <= 64 chars, and mapper recovers empty final text after settled note_write', async () => {
+  // 1. Shortened MCP server alias keeps long tool names within agy 64-char limit
+  const alias = toShortMcpServerAlias('llm_for_zotero_profile_a28d39e2');
+  assert.equal(alias, 'zotero_a28d39e2');
+  assert.ok(`mcp_llm-for-zotero_${alias}_record_paper_decisions`.length <= 64);
+
+  // 2. Compact 200+ KB note_write verification payload (< 4 KB) while preserving receipts
+  const hugeHtml = '<p>' + 'X'.repeat(160_000) + '</p><img src="a.png"/><div data-citation-items="[]"></div>';
+  const hugeText = 'Summary body '.repeat(4_000);
+  const bigNoteWriteResp = {
+    jsonrpc: '2.0',
+    id: 50,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              ok: true,
+              result: {
+                status: 'created',
+                noteId: 10813,
+                title: '论文精读｜Test',
+                noteVerification: {
+                  schemaVersion: 1,
+                  noteId: 10813,
+                  html: hugeHtml,
+                  text: hugeText
+                }
+              },
+              verification: 'verified',
+              verifiedFacts: ['created_note:item:10813']
+            },
+            null,
+            2
+          )
+        }
+      ]
+    }
+  };
+  const compactWrite = await forwardJsonRpcMessage(
+    { jsonrpc: '2.0', id: 50, method: 'tools/call', params: { name: 'note_write', arguments: {} } },
+    { url: 'http://127.0.0.1:1/mcp', headers: {} },
+    async () =>
+      new Response(JSON.stringify(bigNoteWriteResp), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+  );
+  const compactWriteText = compactWrite[0].result.content[0].text;
+  assert.ok(compactWriteText.length < 4000, `expected < 4000 bytes, got ${compactWriteText.length}`);
+  const parsedWrite = JSON.parse(compactWriteText);
+  assert.equal(parsedWrite.ok, true);
+  assert.equal(parsedWrite.result.noteId, 10813);
+  assert.equal(parsedWrite.result.status, 'created');
+  assert.equal(parsedWrite.verification, 'verified');
+  assert.deepEqual(parsedWrite.verifiedFacts, ['created_note:item:10813']);
+  assert.equal(parsedWrite.result.noteVerification.verified, true);
+  assert.equal(parsedWrite.result.noteVerification.embeddedImageCount, 1);
+  assert.equal(parsedWrite.result.noteVerification.embeddedCitationCount, 1);
+
+  // Compact long library_read note bodies
+  const longLibraryResp = compactMcpToolCallResponse('library_read', {}, {
+    jsonrpc: '2.0',
+    id: 51,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            result: {
+              results: {
+                10795: {
+                  notes: [
+                    {
+                      noteId: 10813,
+                      wordCount: 2946,
+                      noteText: 'A'.repeat(20_000),
+                      html: '<div>' + 'B'.repeat(20_000) + '</div>'
+                    }
+                  ]
+                }
+              }
+            }
+          })
+        }
+      ]
+    }
+  });
+  const compactedLibText = longLibraryResp.result.content[0].text;
+  assert.ok(compactedLibText.length < 4000);
+  assert.match(compactedLibText, /truncated \d+ chars; full note verified in Zotero/);
+
+  // 3. Unwrap double-encoded agy tool arguments & synthesize recovery output after settled note_write
+  const unwrapped = normalizeAgyToolArgs({
+    ToolName: '"note_write"',
+    ServerName: '"zotero_a28d39e2"',
+    Arguments: JSON.stringify({ targetItemId: 10795, content: '# 论文精读｜Test Report' })
+  });
+  assert.equal(unwrapped.ToolName, 'note_write');
+  assert.equal(unwrapped.parsedArguments.targetItemId, 10795);
+
+  const recoveredEvents = [];
+  const mapperRecover = createTurnEventMapper({
+    runId: 'r-note-recover',
+    onEvent: (ev) => recoveredEvents.push(ev)
+  });
+  mapperRecover.handleEvent({
+    event: 'step_update',
+    step_update: {
+      step_index: 5,
+      step_type: 'tool',
+      state: 'DONE',
+      tool_name: 'call_mcp_tool',
+      tool_info: {
+        parameters: {
+          ToolName: '"note_write"',
+          ServerName: '"zotero_a28d39e2"',
+          Arguments: JSON.stringify({ targetItemId: 10795, content: '# 论文精读｜Recovered Report' })
+        },
+        output: JSON.stringify({ ok: true, result: { status: 'created', noteId: 10813 } })
+      }
+    }
+  });
+  // Empty result.response with print_timeout recovers cleanly instead of throwing/returning No response
+  mapperRecover.handleEvent({
+    event: 'result',
+    result: { conversation_id: 'c-rec', status: 'SUCCESS', finished_reason: 'print_timeout', response: '' }
+  });
+  assert.equal(mapperRecover.getState().success, true);
+  assert.equal(mapperRecover.getState().settledNoteWrites, 1);
+  assert.match(mapperRecover.getState().output, /Recovered Report/);
+  assert.match(mapperRecover.getState().output, /Note ID: `10813`/);
+  assert.ok(recoveredEvents.some((ev) => ev.type === 'final' && ev.text.includes('Recovered Report')));
+
+  // Verify print_timeout WITHOUT any settled note_write still throws timeout cleanly
+  const mapperNoNote = createTurnEventMapper({ runId: 'r-no-note', onEvent: () => {} });
+  assert.throws(
+    () =>
+      mapperNoNote.handleEvent({
+        event: 'result',
+        result: { conversation_id: 'c-fail', status: 'SUCCESS', finished_reason: 'print_timeout', response: '' }
+      }),
+    (err) => err.errorCode === 'timeout'
+  );
 });

@@ -192,7 +192,7 @@ export function createConfig(env = process.env, argv = []) {
     poolMaxSize: Math.max(1, Number(env.AGY_POOL_MAX_SIZE || 4)),
     poolIdleTtlMs: Math.max(5000, Number(env.AGY_POOL_IDLE_TTL_MS || 300_000)),
     poolMaxTurnsPerProcess: Math.max(1, Number(env.AGY_POOL_MAX_TURNS || 20)),
-    poolMaxProcessAgeMs: Math.max(10_000, Number(env.AGY_POOL_MAX_AGE_MS || 25 * 60 * 1000)),
+    poolMaxProcessAgeMs: Math.max(10_000, Number(env.AGY_POOL_MAX_AGE_MS || 45 * 60 * 1000)),
     maxPrompt: 600_000,
     maxBody: 4_000_000,
     maxNdjsonLine: 2_000_000,

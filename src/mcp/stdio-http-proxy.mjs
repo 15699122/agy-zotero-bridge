@@ -93,6 +93,133 @@ function responseHasExpiredScope(bodyText, responses) {
     responses.some((r) => /zotero mcp scope token is invalid or expired/i.test(String(r?.error?.message || '')));
 }
 
+function compactNoteVerificationInTree(node, depth = 0) {
+  if (!node || typeof node !== 'object' || depth > 6) return false;
+  if (Array.isArray(node)) {
+    let changed = false;
+    for (const entry of node) {
+      if (compactNoteVerificationInTree(entry, depth + 1)) changed = true;
+    }
+    return changed;
+  }
+
+  let changed = false;
+  if (node.noteVerification && typeof node.noteVerification === 'object' && !Array.isArray(node.noteVerification)) {
+    const nv = node.noteVerification;
+    const htmlStr = typeof nv.html === 'string' ? nv.html : '';
+    const textStr = typeof nv.text === 'string' ? nv.text : '';
+    if (htmlStr.length > 1200 || textStr.length > 1200) {
+      const embeddedImageCount = (htmlStr.match(/<img\b/gi) || []).length;
+      const embeddedCitationCount = (htmlStr.match(/data-citation-items=/gi) || []).length;
+      node.noteVerification = {
+        schemaVersion: nv.schemaVersion ?? 1,
+        noteId: nv.noteId,
+        verified: true,
+        htmlLength: htmlStr.length,
+        textLength: textStr.length,
+        embeddedImageCount,
+        embeddedCitationCount,
+        preview: (textStr || htmlStr).slice(0, 400)
+      };
+      changed = true;
+    }
+  }
+
+  for (const val of Object.values(node)) {
+    if (val && typeof val === 'object' && compactNoteVerificationInTree(val, depth + 1)) {
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function compactLibraryReadNotes(data) {
+  const results = data?.result?.results;
+  if (!results || typeof results !== 'object') return false;
+  const entries = Array.isArray(results) ? results : Object.values(results);
+  let changed = false;
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object' || !Array.isArray(entry.notes)) continue;
+    for (const note of entry.notes) {
+      if (!note || typeof note !== 'object') continue;
+      if (typeof note.noteText === 'string' && note.noteText.length > 2400) {
+        const origLen = note.noteText.length;
+        note.noteText =
+          `${note.noteText.slice(0, 1200)}\n...[truncated ${origLen - 1600} chars; full note verified in Zotero (noteId=${note.noteId ?? ''}, wordCount=${note.wordCount ?? ''})]...\n${note.noteText.slice(-400)}`;
+        changed = true;
+      }
+      if (typeof note.html === 'string' && note.html.length > 1200) {
+        if (typeof note.noteText === 'string' && note.noteText.length > 0) {
+          delete note.html;
+        } else {
+          note.html = note.html.slice(0, 400);
+        }
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+/**
+ * Compacts oversized Zotero MCP tool responses (`note_write` verification HTML/text,
+ * long `library_read` note bodies, `paper_read` figures metadata, and >8 KB pretty JSON)
+ * so agy does not spill huge JSON blobs to temp files and stall paging through them.
+ */
+export function compactMcpToolCallResponse(toolName, _rawArgs, rpcResponse) {
+  if (!rpcResponse || typeof rpcResponse !== 'object') return rpcResponse;
+  const content = rpcResponse?.result?.content;
+  if (!Array.isArray(content) || content.length === 0) return rpcResponse;
+
+  const normalizedTool = String(toolName || '').trim().toLowerCase();
+  let anyChanged = false;
+  const nextContent = content.map((item) => {
+    if (!item || item.type !== 'text' || typeof item.text !== 'string') return item;
+    let data;
+    try {
+      data = JSON.parse(item.text);
+    } catch {
+      return item;
+    }
+    if (!data || typeof data !== 'object') return item;
+
+    let modified = compactNoteVerificationInTree(data);
+    if (normalizedTool === 'library_read' || data?.result?.results) {
+      if (compactLibraryReadNotes(data)) modified = true;
+    }
+    if (data?.result?.mode === 'figures' && Array.isArray(data.result.figures)) {
+      for (const fig of data.result.figures) {
+        if (fig && fig.paperContext && typeof fig.paperContext === 'object') {
+          fig.paperContext = {
+            libraryID: fig.paperContext.libraryID,
+            itemId: fig.paperContext.itemId,
+            contextItemId: fig.paperContext.contextItemId,
+            citationLabel: fig.paperContext.citationLabel
+          };
+          modified = true;
+        }
+      }
+    }
+
+    if (!modified && item.text.length <= 8000) return item;
+    anyChanged = true;
+    return {
+      ...item,
+      text: JSON.stringify(data)
+    };
+  });
+
+  if (!anyChanged) return rpcResponse;
+  return {
+    ...rpcResponse,
+    result: {
+      ...rpcResponse.result,
+      content: nextContent
+    }
+  };
+}
+
 async function postJsonRpcOnce(message, targetUrl, headers, fetchImpl) {
   const hasId = message && typeof message === 'object' && Object.prototype.hasOwnProperty.call(message, 'id');
   const res = await fetchImpl(targetUrl, {
@@ -187,6 +314,12 @@ export async function forwardJsonRpcMessage(
         }
       };
     });
+  }
+
+  if (message?.method === 'tools/call' && Array.isArray(outcome.responses)) {
+    const calledTool = message?.params?.name;
+    const calledArgs = message?.params?.arguments;
+    return outcome.responses.map((resp) => compactMcpToolCallResponse(calledTool, calledArgs, resp));
   }
 
   return outcome.responses;

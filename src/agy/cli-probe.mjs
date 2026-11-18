@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
-import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { redactSensitive } from '../security/redact.mjs';
 
@@ -254,7 +254,7 @@ export class CliProbe {
       const { stdout } = await runFile(
         this.config.binary,
         [...this.config.prefixArgs, '--version'],
-        { cwd: this.config.root, timeout: 5000, windowsHide: true }
+        { cwd: tmpdir(), timeout: 5000, windowsHide: true }
       );
       return stdout.trim() || null;
     } catch {
@@ -263,8 +263,35 @@ export class CliProbe {
   }
 
   async getModels(refresh = false) {
-    if (!refresh && this.modelsCache.infos.length > 0 && Date.now() - this.modelsCache.at < 60_000) {
+    if (!refresh && this.modelsCache.infos.length > 0 && Date.now() - this.modelsCache.at < 30 * 60_000) {
       return this.modelsCache.infos;
+    }
+
+    const isMock = Array.isArray(this.config.prefixArgs) && this.config.prefixArgs.some((a) => a.includes('mock-agy'));
+    const cacheFile = !isMock && this.config.stateFile ? join(dirname(this.config.stateFile), 'models-cache.json') : '';
+
+    if (!refresh && cacheFile && this.modelsCache.infos.length === 0) {
+      try {
+        const raw = await readFile(cacheFile, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          Number.isFinite(parsed.at) &&
+          Date.now() - parsed.at < 86_400_000 &&
+          Array.isArray(parsed.infos) &&
+          parsed.infos.length > 0
+        ) {
+          this.modelsCache = {
+            at: parsed.at,
+            infos: parsed.infos,
+            source: parsed.source || 'disk-cache',
+            error: null
+          };
+          return parsed.infos;
+        }
+      } catch {
+        // Ignore missing/invalid disk cache and run live discovery below.
+      }
     }
 
     let infos = [];
@@ -275,7 +302,7 @@ export class CliProbe {
       const { stdout } = await runFile(
         this.config.binary,
         [...this.config.prefixArgs, '--output-format', 'json', 'models'],
-        { cwd: this.config.root, timeout: 12_000, maxBuffer: 1_000_000, windowsHide: true }
+        { cwd: tmpdir(), timeout: 12_000, maxBuffer: 1_000_000, windowsHide: true }
       );
       infos = parseModelsStdout(stdout);
       if (infos.length > 0) source = 'json';
@@ -288,7 +315,7 @@ export class CliProbe {
         const { stdout } = await runFile(
           this.config.binary,
           [...this.config.prefixArgs, 'models'],
-          { cwd: this.config.root, timeout: 12_000, maxBuffer: 1_000_000, windowsHide: true }
+          { cwd: tmpdir(), timeout: 12_000, maxBuffer: 1_000_000, windowsHide: true }
         );
         infos = parseModelsStdout(stdout);
         if (infos.length > 0) source = 'plaintext';
@@ -300,12 +327,23 @@ export class CliProbe {
       }
     }
 
+    const now = Date.now();
     this.modelsCache = {
-      at: Date.now(),
+      at: now,
       infos,
       source,
       error: infos.length ? null : lastErr
     };
+
+    if (cacheFile && infos.length > 0) {
+      try {
+        await mkdir(dirname(cacheFile), { recursive: true });
+        await writeFile(cacheFile, JSON.stringify({ at: now, source, infos }), 'utf8');
+      } catch {
+        // Best-effort disk caching only.
+      }
+    }
+
     return infos;
   }
 

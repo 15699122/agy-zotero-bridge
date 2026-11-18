@@ -133,6 +133,22 @@ export const ZOTERO_WRITE_TOOLS = new Set([
 ]);
 
 /**
+ * Shortens long Zotero MCP profile server keys (`llm_for_zotero_profile_a28d39e2` -> `zotero_a28d39e2`)
+ * so agy's `mcp_llm-for-zotero_<server>_<tool>` identifier stays within the 64-character limit.
+ */
+export function toShortMcpServerAlias(serverName) {
+  const name = String(serverName || '').trim();
+  if (!name || name.length <= 18) return name;
+  let alias = name
+    .replace(/^llm[_-]for[_-]zotero[_-]profile[_-]/i, 'zotero_')
+    .replace(/^llm[_-]for[_-]zotero[_-]/i, 'zotero_');
+  if (alias.length > 18) {
+    alias = alias.slice(0, 18).replace(/[_-]+$/, '');
+  }
+  return alias || name.slice(0, 18);
+}
+
+/**
  * Returns a shallow copy of headers omitting per-turn `X-LLM-For-Zotero-Scope`.
  */
 export function stripScopeHeader(headers = {}) {
@@ -356,9 +372,12 @@ export function buildScopedAgySettings({ serverNames = [], allowedTools = [], re
   const addServerCandidates = (raw) => {
     const name = String(raw || '').trim();
     if (!name) return;
-    candidateServers.add(name);
-    candidateServers.add(`llm-for-zotero_${name}`);
-    candidateServers.add(`llm_for_zotero_${name}`);
+    const alias = toShortMcpServerAlias(name);
+    for (const candidate of new Set([name, alias].filter(Boolean))) {
+      candidateServers.add(candidate);
+      candidateServers.add(`llm-for-zotero_${candidate}`);
+      candidateServers.add(`llm_for_zotero_${candidate}`);
+    }
     candidateServers.add('llm-for-zotero');
     candidateServers.add('llm_for_zotero');
   };
@@ -431,19 +450,30 @@ export function buildScopedAgySettings({ serverNames = [], allowedTools = [], re
  * cleanly per paper, respects read-only mode, and reads back modified items after writes.
  */
 export function buildScopedZoteroRulesMarkdown({ serverNames = [], allowWrite = true } = {}) {
-  const serversList = serverNames.length ? serverNames.map((n) => `\`${n}\``).join(', ') : '`llm-for-zotero`';
+  const displayNames = [];
+  for (const raw of serverNames) {
+    const n = String(raw || '').trim();
+    if (!n) continue;
+    displayNames.push(`\`${n}\``);
+    const alias = toShortMcpServerAlias(n);
+    if (alias && alias !== n) {
+      displayNames.push(`\`${alias}\``);
+    }
+  }
+  const serversList = displayNames.length ? [...new Set(displayNames)].join(', ') : '`llm-for-zotero`';
   const lines = [
     '# Zotero MCP Workspace Rules',
     '',
     '1. **Direct Zotero MCP Tool Usage**: Use `call_mcp_tool` on the active Zotero MCP server(s) (' +
       serversList +
       ') for Zotero library searches (`library_search`), reading items/notes/fulltext (`library_read`, `library_retrieve`, `paper_read`), and loading Zotero skills (`load_skill`). Do NOT run shell commands (`run_command`), because shell execution is disabled in headless safe mode.',
-    '2. **Close Reading & Multimodal Figures (`paper_read`)**: Omit `activeItemId` and `activeContextItemId` to target the active paper in the current chat turn. Call `paper_read({ mode: "overview" })` at most once for high-level summary/metadata, then call `paper_read({ mode: "outline" })` to get the section list (`sectionIds` and chunk ranges), and then call `paper_read({ mode: "targeted", sectionIds: [...] })` or `paper_read({ mode: "targeted", query: "..." })` for detailed methodology, experimental setup, results, and discussion. For figure/table/diagram questions, call `paper_read({ mode: "figures", figureLabels: [...] })` (or `mode: "visual"` for rendered pages / `mode: "capture"` for the active reader view), and use `read_file` or `view_file` on any returned figure crop paths (`artifacts[].storedPath`) or materialized image paths from this prompt to inspect panels visually alongside captions and `targeted` text. Use returned crop `file://` links as-is in `note_write`; do NOT inspect `figure_crops` metadata or read/embed raw MinerU source image paths. If crop extraction fails (`no_figures` / `error`), state clearly that analysis relies on captions and text only.',
+    '2. **Close Reading & Multimodal Figures (`paper_read`)**: When a paper has multiple attachments (e.g. a main `.pdf` and supplementary `.docx`/`.html`), pass `target: { itemId, contextItemId }` pointing to the main PDF `contextItemId` explicitly; otherwise omit `activeItemId` and `activeContextItemId` to target the active paper in the current chat turn. Call `paper_read({ mode: "overview" })` at most once for high-level summary/metadata, then call `paper_read({ mode: "outline" })` to get the section list (`sectionIds` and chunk ranges), and then call `paper_read({ mode: "targeted", sectionIds: [...] })` or `paper_read({ mode: "targeted", query: "..." })` for detailed methodology, experimental setup, results, and discussion. For figure/table/diagram questions, call `paper_read({ mode: "figures", figureLabels: [...] })` (or `mode: "capture"` for the active reader view; avoid `mode: "visual"` unless the PDF is open in a live Zotero reader tab, since `mode: "visual"` fails with `Could not access the PDF document for page rendering` otherwise), and use `read_file` or `view_file` selectively on 4–6 key returned `cropPath` PNGs (or materialized image paths) alongside captions and `targeted` text. Use returned crop `file://` links as-is in `note_write`; do NOT inspect `figure_crops` metadata or read/embed raw MinerU source image paths. If crop extraction fails (`no_figures` / `error`), state clearly that analysis relies on captions and text only.',
     '3. **Multi-Paper Citation & Modality Honesty**: When answering across multiple papers, always attribute findings explicitly by paper title, author/year, and Zotero `libraryID`/`itemKey`/`itemId` without mixing content across papers. Clearly separate direct textual evidence from visual inspection of crop/screenshot images, and never claim to have inspected pixels that were not opened via `read_file`/`view_file`.',
     allowWrite
-      ? '4. **Direct Zotero Library Modification & Readback Verification**: Write tools (`note_write`, `note_write_batch`, `library_update`, `library_import`, `library_delete`, `annotate_pdf`, `file_io`, `undo`, `zotero_script`, etc.) are enabled (`writeEnabled: true`) and may be invoked directly via `call_mcp_tool` to create or modify Zotero notes, tags, collections, and items. Before modifying items, notes, or tags, inspect the target item first, support dry-run preview if requested, and immediately read back the modified item/note via `library_read` or `paper_read` to confirm the change succeeded.'
+      ? '4. **Direct Zotero Library Modification & Readback Verification**: Write tools (`note_write`, `note_write_batch`, `library_update`, `library_import`, `library_delete`, `annotate_pdf`, `file_io`, `undo`, `zotero_script`, etc.) are enabled (`writeEnabled: true`) and may be invoked directly via `call_mcp_tool` to create or modify Zotero notes, tags, collections, and items. Before modifying items, notes, or tags, inspect the target item first and support dry-run preview if requested. Note that `note_write` / `note_write_batch` already execute host-side verification and return `verification: "verified"` / `createdNoteReceipt` directly — once `note_write` returns `ok: true` and `status: "created"` / `"applied"`, do NOT call `library_read` or `read_file` in a loop to re-read the created note body; proceed immediately to the final response.'
       : '4. **Strict Read-Only Mode**: Write mode is disabled (`writeEnabled: false`). Only invoke read-only Zotero MCP tools; do not attempt to create/edit notes, tags, metadata, or delete library items, and clearly inform the user if a task requires write permission.',
-    '5. **Batch Literature Review & Ultra-Long Context (8–50+ Papers)**: When comparing or reviewing many papers or a collection/tag scope, never try to read every full paper in one unbatched step. Follow a 3-tier strategy: (a) establish the paper ledger using the supplied Multi-Paper Scope Manifest, `library_search`, `library_retrieve({ intent: "enumerate" | "summarize" })`, or `paper_digest`; (b) batch `paper_read` with `targets` (3–6 related papers per call) and drill down via `mode: "outline"` -> `mode: "targeted"`; (c) record coverage via `review_coverage` / `record_paper_decisions` and explicitly state the coverage frontier (how many papers were read in full vs in part vs metadata-only) and preserve negative or contradictory findings.'
+    '5. **Batch Literature Review & Ultra-Long Context (8–50+ Papers)**: When comparing or reviewing many papers or a collection/tag scope, never try to read every full paper in one unbatched step. Follow a 3-tier strategy: (a) establish the paper ledger using the supplied Multi-Paper Scope Manifest, `library_search`, `library_retrieve({ intent: "enumerate" | "summarize" })`, or `paper_digest`; (b) batch `paper_read` with `targets` (3–6 related papers per call) and drill down via `mode: "outline"` -> `mode: "targeted"`; (c) record coverage via `review_coverage` / `record_paper_decisions` and explicitly state the coverage frontier (how many papers were read in full vs in part vs metadata-only) and preserve negative or contradictory findings.',
+    '6. **Orchestrator & Plan Mode Efficiency (`exit_plan_mode`)**: When operating in Plan / Orchestrator mode, keep the planning phase fast and concise (`<= 600` words structural outline after checking section outline and skills — NEVER draft the multi-thousand-word report inside `exit_plan_mode`). In the execution phase, invoke `note_write` once cleanly, accept its `verified` receipt, and ALWAYS emit a concise non-empty final summary in chat immediately so the turn closes cleanly.'
   ];
   return lines.join('\n') + '\n';
 }
@@ -508,6 +538,10 @@ export async function prepareScopedMcpPlugin({ cwd, mcpServers, allowedTools = [
 
     normalizedServers[name] = { url, headers };
     headersByServer[name] = { url, headers };
+    const alias = toShortMcpServerAlias(name);
+    if (alias && alias !== name) {
+      headersByServer[alias] = { url, headers };
+    }
     summary.push({ name, url, hasAuth: Object.keys(headers).some((k) => k.toLowerCase() === 'authorization') });
   }
 
@@ -547,7 +581,8 @@ export async function prepareScopedMcpPlugin({ cwd, mcpServers, allowedTools = [
 
   const mcpServersConfig = {};
   for (const name of serverNames) {
-    mcpServersConfig[name] = {
+    const mcpKey = toShortMcpServerAlias(name);
+    mcpServersConfig[mcpKey] = {
       command: process.execPath,
       args: [PROXY_SCRIPT_PATH, '--server', name, '--headers-file', headersFile],
       env: {

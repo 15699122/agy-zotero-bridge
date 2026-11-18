@@ -790,6 +790,18 @@ export async function runClaudeCodeAgyShim({
             break;
           }
 
+          if (!interruptRequested && state.settledNoteWrites > 0 && state.synthesizedOutput) {
+            const recoveredText = state.output.trim() ? state.output : state.synthesizedOutput;
+            if (!state.output.trim()) {
+              emitSdkEvent({ type: 'message_delta', text: recoveredText }, mapper, true, pooledState);
+            }
+            finalState = { ...state, output: recoveredText, success: true };
+            finalFailure = null;
+            finalClassified = null;
+            closeWarmRuntime();
+            break;
+          }
+
           closeWarmRuntime();
           finalClassified = classifyAgyError(failure.message, turnStderr, turnExitCode || 1, [config.token]);
           if (
@@ -896,6 +908,17 @@ export async function runClaudeCodeAgyShim({
           finalFailure = failure;
 
           if (!failure) {
+            finalClassified = null;
+            break;
+          }
+
+          if (!interruptRequested && state.settledNoteWrites > 0 && state.synthesizedOutput) {
+            const recoveredText = state.output.trim() ? state.output : state.synthesizedOutput;
+            if (!state.output.trim()) {
+              emitSdkEvent({ type: 'message_delta', text: recoveredText }, mapper, false, nonPooledState);
+            }
+            finalState = { ...state, output: recoveredText, success: true };
+            finalFailure = null;
             finalClassified = null;
             break;
           }
