@@ -275,7 +275,7 @@ export async function extractInstructionDirectories(text) {
   const matches = new Set();
   for (const re of [
     /[A-Za-z]:[\\/][^\r\n"'`<>|?*:]+/g,
-    /\/(?:Users|home)\/[^\r\n"'`\s:]+/g
+    /\/(?:Users|home|tmp|private\/tmp|var\/tmp)\/[^\r\n"'`\s:]+/g
   ]) {
     let m;
     while ((m = re.exec(input)) !== null) {

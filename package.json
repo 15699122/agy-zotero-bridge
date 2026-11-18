@@ -10,7 +10,8 @@
     "start": "node bridge.mjs",
     "bundle": "node scripts/bundle.mjs",
     "test": "node --test test/*.test.mjs",
-    "test:unit": "node --test test/unit.test.mjs test/bundle.test.mjs",
+    "test:unit": "node --test test/unit.test.mjs",
+    "test:bundle": "node --test test/bundle.test.mjs",
     "test:integration": "node --test test/bridge.test.mjs"
   }
 }
