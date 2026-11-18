@@ -45,14 +45,24 @@ export function normalizeCumulativeUsage(currentUsage, previousCumulativeUsage =
 }
 
 /**
- * Optional M4 session process pool (opt-in via AGY_PROCESS_POOL=1).
- * Tracks retention state, LRU capacity eviction, idle TTL cleanup, and process-tree teardown.
+ * M4/M7-01 session process pool (enabled by default unless AGY_PROCESS_POOL=0).
+ * Tracks retention state, LRU capacity eviction, idle TTL cleanup,
+ * max-turn / max-age rotation, and process-tree teardown.
  */
 export class SessionProcessPool {
-  constructor({ enabled = false, maxSize = 4, idleTtlMs = 300_000, onKill = killProcessTree } = {}) {
+  constructor({
+    enabled = true,
+    maxSize = 4,
+    idleTtlMs = 300_000,
+    maxTurnsPerProcess = 20,
+    maxProcessAgeMs = 25 * 60 * 1000,
+    onKill = killProcessTree
+  } = {}) {
     this.enabled = Boolean(enabled);
     this.maxSize = Math.max(1, Number(maxSize) || 4);
     this.idleTtlMs = Math.max(10, Number(idleTtlMs) || 300_000);
+    this.maxTurnsPerProcess = Math.max(1, Number(maxTurnsPerProcess) || 20);
+    this.maxProcessAgeMs = Math.max(1000, Number(maxProcessAgeMs) || 25 * 60 * 1000);
     this.onKill = onKill;
     this.entries = new Map();
     this.retainedKeys = new Set();
@@ -123,12 +133,40 @@ export class SessionProcessPool {
       meta,
       cumulativeUsage,
       busy: Boolean(busy),
+      turnCount: 0,
       createdAt: now,
       lastUsedAt: now,
       timer: null
     };
     this.entries.set(scopedKey, entry);
     this.#scheduleIdleTimer(scopedKey, entry);
+    return entry;
+  }
+
+  isReusable(scopedKey, signature) {
+    if (!this.enabled || !scopedKey) return false;
+    const entry = this.entries.get(scopedKey);
+    if (!entry || !entry.child) return false;
+    if (entry.meta?.closed || entry.child.exitCode !== null || entry.child.signalCode !== null) {
+      return false;
+    }
+    if (entry.meta?.signature !== signature) return false;
+    if ((entry.turnCount || 0) >= this.maxTurnsPerProcess) return false;
+    if (Date.now() - entry.createdAt >= this.maxProcessAgeMs) return false;
+    return true;
+  }
+
+  recordTurn(scopedKey, { sessionId = '', cumulativeUsage = null } = {}) {
+    const entry = this.entries.get(scopedKey);
+    if (!entry) return null;
+    entry.turnCount = (entry.turnCount || 0) + 1;
+    entry.lastUsedAt = Date.now();
+    if (sessionId) entry.sessionId = sessionId;
+    if (cumulativeUsage) entry.cumulativeUsage = cumulativeUsage;
+    if (entry.turnCount >= this.maxTurnsPerProcess || Date.now() - entry.createdAt >= this.maxProcessAgeMs) {
+      this.invalidate(scopedKey, { keepRetained: true });
+      return null;
+    }
     return entry;
   }
 
@@ -155,8 +193,10 @@ export class SessionProcessPool {
     return entry;
   }
 
-  invalidate(scopedKey) {
-    this.retainedKeys.delete(scopedKey);
+  invalidate(scopedKey, { keepRetained = false } = {}) {
+    if (!keepRetained) {
+      this.retainedKeys.delete(scopedKey);
+    }
     const entry = this.entries.get(scopedKey);
     if (!entry) return false;
     if (entry.timer) clearTimeout(entry.timer);
@@ -186,6 +226,8 @@ export class SessionProcessPool {
       size: this.entries.size,
       maxSize: this.maxSize,
       idleTtlMs: this.idleTtlMs,
+      maxTurnsPerProcess: this.maxTurnsPerProcess,
+      maxProcessAgeMs: this.maxProcessAgeMs,
       retainedCount: this.retainedKeys.size
     };
   }

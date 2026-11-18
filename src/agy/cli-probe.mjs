@@ -380,6 +380,13 @@ export class CliProbe {
         dimensions: this.config.embeddingDimensions,
         endpoint: '/v1/embeddings'
       },
+      processPool: {
+        enabled: this.config.processPoolEnabled,
+        maxSize: this.config.poolMaxSize,
+        idleTtlMs: this.config.poolIdleTtlMs,
+        maxTurnsPerProcess: this.config.poolMaxTurnsPerProcess,
+        maxProcessAgeMs: this.config.poolMaxProcessAgeMs
+      },
       diagnostics: {
         binary: this.config.binary,
         authCredentialsPresent,

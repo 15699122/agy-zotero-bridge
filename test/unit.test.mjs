@@ -632,6 +632,10 @@ test('normalizeCumulativeUsage and SessionProcessPool enforce non-negative delta
   assert.equal(disabledPool.retain('k1', true), false);
   assert.equal(disabledPool.register('k1', { child: { id: 1 } }), null);
 
+  assert.equal(createConfig({}).processPoolEnabled, true);
+  assert.equal(createConfig({ AGY_PROCESS_POOL: '0' }).processPoolEnabled, false);
+  assert.equal(createConfig({ AGY_PROCESS_POOL: '1' }).processPoolAlways, true);
+
   const killed = [];
   const pool = new SessionProcessPool({
     enabled: true,
@@ -662,6 +666,35 @@ test('normalizeCumulativeUsage and SessionProcessPool enforce non-negative delta
     assert.ok(killed.includes('p4'));
   } finally {
     pool.close();
+  }
+
+  const rotKilled = [];
+  const rotPool = new SessionProcessPool({
+    enabled: true,
+    maxSize: 2,
+    idleTtlMs: 60_000,
+    maxTurnsPerProcess: 2,
+    onKill: (c) => rotKilled.push(c.id)
+  });
+  try {
+    rotPool.retain('rk1', true);
+    const liveChild = { id: 'rp1', exitCode: null, signalCode: null };
+    rotPool.register('rk1', {
+      child: liveChild,
+      sessionId: 'rs1',
+      meta: { signature: 'sig-a', closed: false }
+    });
+    assert.equal(rotPool.isReusable('rk1', 'sig-a'), true);
+    assert.equal(rotPool.isReusable('rk1', 'sig-b'), false);
+
+    assert.ok(rotPool.recordTurn('rk1', { sessionId: 'rs1' }));
+    assert.equal(rotPool.isReusable('rk1', 'sig-a'), true);
+    assert.equal(rotPool.recordTurn('rk1', { sessionId: 'rs1' }), null);
+    assert.ok(rotKilled.includes('rp1'));
+    assert.equal(rotPool.get('rk1'), null);
+    assert.equal(rotPool.isRetained('rk1'), true);
+  } finally {
+    rotPool.close();
   }
 });
 

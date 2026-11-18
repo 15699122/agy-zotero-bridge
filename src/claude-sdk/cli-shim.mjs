@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { CliProbe, resolveAgyModelAndEffort } from '../agy/cli-probe.mjs';
+import { normalizeCumulativeUsage } from '../agy/process-pool.mjs';
 import { killProcessTree, permissionArgs } from '../agy/process-runner.mjs';
 import { BRIDGE_VERSION, createConfig } from '../config.mjs';
 import { discoverSafeReadDirs, materializeTurnImages, renderMultimodalImagePrompt } from '../context/prompt-builder.mjs';
@@ -336,6 +337,70 @@ export async function runClaudeCodeAgyShim({
   let lastContextTokens = 0;
   let activeChild = null;
   let interruptRequested = false;
+  let warmRuntime = null;
+
+  const closeWarmRuntime = () => {
+    if (!warmRuntime) return;
+    const rt = warmRuntime;
+    warmRuntime = null;
+    try {
+      rt.rl?.close();
+    } catch {}
+    killProcessTree(rt.child);
+  };
+
+  const isWarmRuntimeReusable = (signature) => {
+    if (!warmRuntime || !warmRuntime.child) return false;
+    if (warmRuntime.closed || warmRuntime.child.exitCode !== null || warmRuntime.child.signalCode !== null) {
+      return false;
+    }
+    if (warmRuntime.signature !== signature) return false;
+    if ((warmRuntime.turnCount || 0) >= config.poolMaxTurnsPerProcess) return false;
+    if (Date.now() - warmRuntime.createdAt >= config.poolMaxProcessAgeMs) return false;
+    return true;
+  };
+
+  const spawnWarmRuntime = (spawnArgs, signature) => {
+    closeWarmRuntime();
+    const child = spawn(config.binary, [...config.prefixArgs, ...spawnArgs], {
+      cwd: workCwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+    const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    const rt = {
+      child,
+      rl,
+      signature,
+      createdAt: Date.now(),
+      turnCount: 0,
+      cumulativeUsage: null,
+      closed: false,
+      exitInfo: { code: null, signal: null },
+      childError: null,
+      activeTurn: null
+    };
+    child.on('error', (err) => {
+      rt.childError = err;
+      rt.activeTurn?.onError(err);
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      rt.activeTurn?.onStderr(chunk);
+    });
+    rl.on('line', (line) => {
+      rt.activeTurn?.onLine(line);
+    });
+    child.once('close', (code, signal) => {
+      rt.closed = true;
+      rt.exitInfo = { code, signal };
+      rl.close();
+      rt.activeTurn?.onClose(rt.exitInfo);
+      if (warmRuntime === rt) warmRuntime = null;
+    });
+    warmRuntime = rt;
+    return rt;
+  };
 
   const writeJsonLine = (obj) => {
     stdout.write(JSON.stringify(obj) + '\n');
@@ -443,215 +508,410 @@ export async function runClaudeCodeAgyShim({
         }
       }
 
-      const args = ['-p', fullPrompt, '--output-format', 'stream-json', '--disable-slash-commands'];
-      if (activeResumeId && !parsed.noSessionPersistence) {
-        args.push('--conversation', activeResumeId);
-      }
-      if (model && model !== 'default') args.push('--model', model);
-      if (effort && effort !== 'default') args.push('--effort', effort);
-      if (activeJsonSchema) args.push('--json-schema', activeJsonSchema);
-      args.push(...permFlags);
-      if (settingsFile && effectivePermissionMode !== 'plan') {
-        args.push('--settings', settingsFile);
-      }
-      for (const dir of readDirs) {
-        args.push('--add-dir', dir);
-      }
+      const canPoolShim = Boolean(
+        parsed.inputFormat === 'stream-json' &&
+          config.processPoolEnabled &&
+          !noToolsMode &&
+          effectivePermissionMode !== 'plan' &&
+          !activeJsonSchema &&
+          !parsed.noSessionPersistence
+      );
 
       let finalState = null;
       let finalLastUsage = null;
       let finalFailure = null;
       let finalClassified = null;
 
-      for (let attempt = 0; attempt <= config.rateLimitMaxRetries; attempt += 1) {
-        let turnStderr = '';
-        let childError = null;
-        let lastUsage = null;
+      const emitSdkEvent = (ev, mapper, isPooled, pooledState) => {
+        const sessionId = mapper.getState().sessionId || ev.sessionId || fallbackSessionId;
+        if (ev.type === 'provider_event' && ev.providerType === 'agy_session') {
+          emitInitIfNeeded(sessionId);
+          return;
+        }
+        if (ev.type === 'message_delta') {
+          emitInitIfNeeded(sessionId);
+          writeJsonLine({
+            type: 'stream_event',
+            session_id: sessionId,
+            event: {
+              type: 'content_block_delta',
+              index: 0,
+              delta: { type: 'text_delta', text: ev.text }
+            }
+          });
+          return;
+        }
+        if (ev.type === 'tool_call') {
+          emitInitIfNeeded(sessionId);
+          writeJsonLine({
+            type: 'assistant',
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            message: {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'tool_use',
+                  id: ev.callId,
+                  name: ev.name,
+                  input: ev.args ?? {}
+                }
+              ]
+            }
+          });
+          return;
+        }
+        if (ev.type === 'tool_result') {
+          emitInitIfNeeded(sessionId);
+          writeJsonLine({
+            type: 'user',
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: ev.callId,
+                  content: ev.content ?? '',
+                  is_error: ev.ok === false
+                }
+              ]
+            }
+          });
+          return;
+        }
+        if (ev.type === 'tool_error') {
+          emitInitIfNeeded(sessionId);
+          writeJsonLine({
+            type: 'user',
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: ev.callId,
+                  content: ev.error || 'tool_error',
+                  is_error: true
+                }
+              ]
+            }
+          });
+          return;
+        }
+        if (ev.type === 'usage') {
+          let usagePayload = ev;
+          if (isPooled && pooledState) {
+            const normalized = normalizeCumulativeUsage(ev, pooledState.prevCumulativeUsage);
+            pooledState.latestCumulativeUsage = normalized.cumulative;
+            usagePayload = normalized;
+          }
+          const lastUsageObj = {
+            input_tokens: usagePayload.inputTokens,
+            output_tokens: usagePayload.outputTokens,
+            cache_creation_input_tokens: usagePayload.cacheCreationInputTokens || 0,
+            cache_read_input_tokens: usagePayload.cacheReadInputTokens || 0
+          };
+          if (pooledState) pooledState.lastUsage = lastUsageObj;
+          lastContextTokens =
+            usagePayload.contextTokens ||
+            usagePayload.inputTokens + usagePayload.outputTokens + (usagePayload.cacheReadInputTokens || 0);
+          writeJsonLine({
+            type: 'stream_event',
+            session_id: sessionId,
+            event: {
+              type: 'message_delta',
+              usage: lastUsageObj
+            }
+          });
+        }
+      };
 
-        const child = spawn(config.binary, [...config.prefixArgs, ...args], {
-          cwd: workCwd,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          windowsHide: true
-        });
-        activeChild = child;
-
-        child.on('error', (err) => {
-          childError = err;
-        });
-        child.stderr.setEncoding('utf8');
-        child.stderr.on('data', (chunk) => {
-          turnStderr = (turnStderr + chunk).slice(-config.maxStderr);
-        });
-
-        const mapper = createTurnEventMapper({
-          runId: `agy-shim-${randomUUID()}`,
+      if (canPoolShim) {
+        const shimSignature = JSON.stringify({
+          workCwd,
           model,
-          onTools: (tools) => {
-            toolsFromInit = tools;
-          },
-          onEvent: (ev) => {
-            const sessionId = mapper.getState().sessionId || ev.sessionId || fallbackSessionId;
-            if (ev.type === 'provider_event' && ev.providerType === 'agy_session') {
-              emitInitIfNeeded(sessionId);
-              return;
+          effort,
+          effectivePermissionMode,
+          allowWriteForTurn,
+          settingsFile,
+          readDirs
+        });
+        const poolPrintTimeoutSec = Math.max(120, Math.ceil(((config.poolMaxProcessAgeMs || 1_500_000) + 60_000) / 1000));
+
+        for (let attempt = 0; attempt <= config.rateLimitMaxRetries; attempt += 1) {
+          let rt = isWarmRuntimeReusable(shimSignature) ? warmRuntime : null;
+          if (!rt) {
+            const poolArgs = [
+              '--input-format',
+              'stream-json',
+              '--output-format',
+              'stream-json',
+              '--print=',
+              '--print-timeout',
+              `${poolPrintTimeoutSec}s`,
+              '--disable-slash-commands'
+            ];
+            if (activeResumeId) poolArgs.push('--conversation', activeResumeId);
+            if (model && model !== 'default') poolArgs.push('--model', model);
+            if (effort && effort !== 'default') poolArgs.push('--effort', effort);
+            poolArgs.push(...permFlags);
+            if (settingsFile) poolArgs.push('--settings', settingsFile);
+            for (const dir of readDirs) poolArgs.push('--add-dir', dir);
+            rt = spawnWarmRuntime(poolArgs, shimSignature);
+          }
+
+          activeChild = rt.child;
+          let turnStderr = '';
+          const pooledState = { prevCumulativeUsage: rt.cumulativeUsage, latestCumulativeUsage: null, lastUsage: null };
+          const mapper = createTurnEventMapper({
+            runId: `agy-shim-${randomUUID()}`,
+            model,
+            onTools: (tools) => {
+              toolsFromInit = tools;
+            },
+            onEvent: (ev) => emitSdkEvent(ev, mapper, true, pooledState),
+            maxNdjsonLine: config.maxNdjsonLine,
+            extraSecrets: [config.token]
+          });
+
+          let turnError = null;
+          let turnExitCode = 0;
+          try {
+            if (rt.childError) throw rt.childError;
+            if (rt.closed || rt.child.exitCode !== null || rt.child.signalCode !== null) {
+              throw new Error('pooled agy process exited before turn');
             }
-            if (ev.type === 'message_delta') {
-              emitInitIfNeeded(sessionId);
-              writeJsonLine({
-                type: 'stream_event',
-                session_id: sessionId,
-                event: {
-                  type: 'content_block_delta',
-                  index: 0,
-                  delta: { type: 'text_delta', text: ev.text }
+
+            await new Promise((resolveTurn, rejectTurn) => {
+              let settled = false;
+              let settleTimer = null;
+              const clearSettle = () => {
+                if (settleTimer) {
+                  clearTimeout(settleTimer);
+                  settleTimer = null;
                 }
-              });
-              return;
-            }
-            if (ev.type === 'tool_call') {
-              emitInitIfNeeded(sessionId);
-              writeJsonLine({
-                type: 'assistant',
-                session_id: sessionId,
-                parent_tool_use_id: null,
-                message: {
-                  role: 'assistant',
-                  content: [
-                    {
-                      type: 'tool_use',
-                      id: ev.callId,
-                      name: ev.name,
-                      input: ev.args ?? {}
-                    }
-                  ]
-                }
-              });
-              return;
-            }
-            if (ev.type === 'tool_result') {
-              emitInitIfNeeded(sessionId);
-              writeJsonLine({
-                type: 'user',
-                session_id: sessionId,
-                parent_tool_use_id: null,
-                message: {
-                  role: 'user',
-                  content: [
-                    {
-                      type: 'tool_result',
-                      tool_use_id: ev.callId,
-                      content: ev.content ?? '',
-                      is_error: ev.ok === false
-                    }
-                  ]
-                }
-              });
-              return;
-            }
-            if (ev.type === 'tool_error') {
-              emitInitIfNeeded(sessionId);
-              writeJsonLine({
-                type: 'user',
-                session_id: sessionId,
-                parent_tool_use_id: null,
-                message: {
-                  role: 'user',
-                  content: [
-                    {
-                      type: 'tool_result',
-                      tool_use_id: ev.callId,
-                      content: ev.error || 'tool_error',
-                      is_error: true
-                    }
-                  ]
-                }
-              });
-              return;
-            }
-            if (ev.type === 'usage') {
-              lastUsage = {
-                input_tokens: ev.inputTokens,
-                output_tokens: ev.outputTokens,
-                cache_creation_input_tokens: ev.cacheCreationInputTokens || 0,
-                cache_read_input_tokens: ev.cacheReadInputTokens || 0
               };
-              lastContextTokens =
-                ev.contextTokens ||
-                ev.inputTokens + ev.outputTokens + (ev.cacheReadInputTokens || 0);
-              writeJsonLine({
-                type: 'stream_event',
-                session_id: sessionId,
-                event: {
-                  type: 'message_delta',
-                  usage: lastUsage
+              const failTurn = (err) => {
+                if (settled) return;
+                settled = true;
+                clearSettle();
+                rt.activeTurn = null;
+                rejectTurn(err);
+              };
+              const succeedTurn = () => {
+                if (settled) return;
+                settled = true;
+                clearSettle();
+                rt.activeTurn = null;
+                resolveTurn();
+              };
+
+              rt.activeTurn = {
+                onStderr(chunk) {
+                  turnStderr = (turnStderr + chunk).slice(-config.maxStderr);
+                },
+                onLine(line) {
+                  if (settled) return;
+                  try {
+                    mapper.processLine(line);
+                  } catch (err) {
+                    failTurn(err);
+                    return;
+                  }
+                  const st = mapper.getState();
+                  if (st.resultSeen) {
+                    if (st.success) {
+                      clearSettle();
+                      settleTimer = setTimeout(() => {
+                        if (settled) return;
+                        const code = rt.exitInfo?.code ?? rt.child.exitCode;
+                        if (code !== null && code !== 0) {
+                          turnExitCode = code;
+                          failTurn(new Error(`agy process exited with code ${code}`));
+                          return;
+                        }
+                        succeedTurn();
+                      }, 15);
+                    } else {
+                      failTurn(new Error('agy did not complete successfully'));
+                    }
+                  }
+                },
+                onError(e) {
+                  failTurn(e);
+                },
+                onClose(exitInfo) {
+                  turnExitCode = exitInfo?.code ?? 1;
+                  if (turnExitCode !== 0) {
+                    failTurn(new Error(`agy process exited with code ${turnExitCode}`));
+                  } else {
+                    failTurn(new Error('agy exited without a terminal result'));
+                  }
                 }
+              };
+
+              const payload = JSON.stringify({ event: 'user', message: { content: fullPrompt } }) + '\n';
+              rt.child.stdin.write(payload, 'utf8', (writeErr) => {
+                if (writeErr) failTurn(writeErr);
               });
-            }
-          },
-          maxNdjsonLine: config.maxNdjsonLine,
-          extraSecrets: [config.token]
-        });
-
-        let mapperError = null;
-        const rlOut = createInterface({ input: child.stdout, crlfDelay: Infinity });
-        try {
-          for await (const line of rlOut) {
-            try {
-              mapper.processLine(line);
-            } catch (err) {
-              mapperError = err;
-              killProcessTree(child);
-              break;
-            }
+            });
+          } catch (err) {
+            turnError = err;
           }
-        } finally {
-          rlOut.close();
-        }
 
-        const exitInfo = await new Promise((resolveExit) => {
-          if (childError || child.exitCode !== null || child.signalCode !== null) {
-            resolveExit({ code: child.exitCode ?? 1, signal: child.signalCode });
-            return;
+          activeChild = null;
+          if (turnStderr.trim()) {
+            stderr.write(redactSensitive(turnStderr, [config.token]));
           }
-          const finish = (code, signal) => resolveExit({ code, signal });
-          child.once('close', finish);
-          child.once('error', () => finish(child.exitCode ?? 1, child.signalCode));
-        });
-        activeChild = null;
 
-        if (turnStderr.trim()) {
-          stderr.write(redactSensitive(turnStderr, [config.token]));
-        }
+          const state = mapper.getState();
+          const failure =
+            turnError ||
+            (interruptRequested ? new Error('interrupted') : null) ||
+            (!state.resultSeen ? new Error('agy exited without a terminal result') : null) ||
+            (!state.success ? new Error('agy did not complete successfully') : null);
 
-        const state = mapper.getState();
-        const failure =
-          childError ||
-          mapperError ||
-          (interruptRequested ? new Error('interrupted') : null) ||
-          (!state.resultSeen ? new Error('agy exited without a terminal result') : null) ||
-          (exitInfo.code !== 0 ? new Error(`agy process exited with code ${exitInfo.code}`) : null) ||
-          (!state.success ? new Error('agy did not complete successfully') : null);
+          finalState = state;
+          finalLastUsage = pooledState.lastUsage;
+          finalFailure = failure;
 
-        finalState = state;
-        finalLastUsage = lastUsage;
-        finalFailure = failure;
+          if (!failure) {
+            if (pooledState.latestCumulativeUsage) {
+              rt.cumulativeUsage = pooledState.latestCumulativeUsage;
+            }
+            rt.turnCount = (rt.turnCount || 0) + 1;
+            if (rt.turnCount >= config.poolMaxTurnsPerProcess || Date.now() - rt.createdAt >= config.poolMaxProcessAgeMs) {
+              closeWarmRuntime();
+            }
+            finalClassified = null;
+            break;
+          }
 
-        if (!failure) {
-          finalClassified = null;
+          closeWarmRuntime();
+          finalClassified = classifyAgyError(failure.message, turnStderr, turnExitCode || 1, [config.token]);
+          if (
+            finalClassified.code === 'rate_limited' &&
+            !interruptRequested &&
+            state.settledToolCount === 0 &&
+            attempt < config.rateLimitMaxRetries
+          ) {
+            await new Promise((r) => setTimeout(r, config.rateLimitRetryDelayMs * (attempt + 1)));
+            continue;
+          }
           break;
         }
-
-        finalClassified = classifyAgyError(failure.message, turnStderr, exitInfo.code ?? 1, [config.token]);
-        if (
-          finalClassified.code === 'rate_limited' &&
-          !interruptRequested &&
-          state.settledToolCount === 0 &&
-          attempt < config.rateLimitMaxRetries
-        ) {
-          await new Promise((r) => setTimeout(r, config.rateLimitRetryDelayMs * (attempt + 1)));
-          continue;
+      } else {
+        closeWarmRuntime();
+        const args = ['-p', fullPrompt, '--output-format', 'stream-json', '--disable-slash-commands'];
+        if (activeResumeId && !parsed.noSessionPersistence) {
+          args.push('--conversation', activeResumeId);
         }
-        break;
+        if (model && model !== 'default') args.push('--model', model);
+        if (effort && effort !== 'default') args.push('--effort', effort);
+        if (activeJsonSchema) args.push('--json-schema', activeJsonSchema);
+        args.push(...permFlags);
+        if (settingsFile && effectivePermissionMode !== 'plan') {
+          args.push('--settings', settingsFile);
+        }
+        for (const dir of readDirs) {
+          args.push('--add-dir', dir);
+        }
+
+        for (let attempt = 0; attempt <= config.rateLimitMaxRetries; attempt += 1) {
+          let turnStderr = '';
+          let childError = null;
+          const nonPooledState = { lastUsage: null };
+
+          const child = spawn(config.binary, [...config.prefixArgs, ...args], {
+            cwd: workCwd,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true
+          });
+          activeChild = child;
+
+          child.on('error', (err) => {
+            childError = err;
+          });
+          child.stderr.setEncoding('utf8');
+          child.stderr.on('data', (chunk) => {
+            turnStderr = (turnStderr + chunk).slice(-config.maxStderr);
+          });
+
+          const mapper = createTurnEventMapper({
+            runId: `agy-shim-${randomUUID()}`,
+            model,
+            onTools: (tools) => {
+              toolsFromInit = tools;
+            },
+            onEvent: (ev) => emitSdkEvent(ev, mapper, false, nonPooledState),
+            maxNdjsonLine: config.maxNdjsonLine,
+            extraSecrets: [config.token]
+          });
+
+          let mapperError = null;
+          const rlOut = createInterface({ input: child.stdout, crlfDelay: Infinity });
+          try {
+            for await (const line of rlOut) {
+              try {
+                mapper.processLine(line);
+              } catch (err) {
+                mapperError = err;
+                killProcessTree(child);
+                break;
+              }
+            }
+          } finally {
+            rlOut.close();
+          }
+
+          const exitInfo = await new Promise((resolveExit) => {
+            if (childError || child.exitCode !== null || child.signalCode !== null) {
+              resolveExit({ code: child.exitCode ?? 1, signal: child.signalCode });
+              return;
+            }
+            const finish = (code, signal) => resolveExit({ code, signal });
+            child.once('close', finish);
+            child.once('error', () => finish(child.exitCode ?? 1, child.signalCode));
+          });
+          activeChild = null;
+
+          if (turnStderr.trim()) {
+            stderr.write(redactSensitive(turnStderr, [config.token]));
+          }
+
+          const state = mapper.getState();
+          const failure =
+            childError ||
+            mapperError ||
+            (interruptRequested ? new Error('interrupted') : null) ||
+            (!state.resultSeen ? new Error('agy exited without a terminal result') : null) ||
+            (exitInfo.code !== 0 ? new Error(`agy process exited with code ${exitInfo.code}`) : null) ||
+            (!state.success ? new Error('agy did not complete successfully') : null);
+
+          finalState = state;
+          finalLastUsage = nonPooledState.lastUsage;
+          finalFailure = failure;
+
+          if (!failure) {
+            finalClassified = null;
+            break;
+          }
+
+          finalClassified = classifyAgyError(failure.message, turnStderr, exitInfo.code ?? 1, [config.token]);
+          if (
+            finalClassified.code === 'rate_limited' &&
+            !interruptRequested &&
+            state.settledToolCount === 0 &&
+            attempt < config.rateLimitMaxRetries
+          ) {
+            await new Promise((r) => setTimeout(r, config.rateLimitRetryDelayMs * (attempt + 1)));
+            continue;
+          }
+          break;
+        }
       }
 
       const sessionId = finalState?.sessionId || fallbackSessionId;
@@ -776,6 +1036,7 @@ export async function runClaudeCodeAgyShim({
       } else if (subtype === 'interrupt') {
         interruptRequested = true;
         if (activeChild) killProcessTree(activeChild);
+        closeWarmRuntime();
         response = {};
       }
 
@@ -841,7 +1102,10 @@ export async function runClaudeCodeAgyShim({
 
   await new Promise((resolveDone) => {
     rlIn.once('close', () => {
-      void turnChain.finally(resolveDone);
+      void turnChain.finally(() => {
+        closeWarmRuntime();
+        resolveDone();
+      });
     });
   });
 

@@ -63,7 +63,9 @@ export function createBridgeApp(config) {
   const processPool = new SessionProcessPool({
     enabled: config.processPoolEnabled,
     maxSize: config.poolMaxSize,
-    idleTtlMs: config.poolIdleTtlMs
+    idleTtlMs: config.poolIdleTtlMs,
+    maxTurnsPerProcess: config.poolMaxTurnsPerProcess,
+    maxProcessAgeMs: config.poolMaxProcessAgeMs
   });
   const embeddingService = new EmbeddingService(config);
   let knownTools = [];

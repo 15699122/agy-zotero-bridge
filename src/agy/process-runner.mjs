@@ -226,7 +226,7 @@ function createPooledChildRuntime({
     rl.close();
     runtime.activeTurn?.onClose(runtime.exitInfo);
     if (processPool.get(key) === entry) {
-      processPool.invalidate(key);
+      processPool.invalidate(key, { keepRetained: true });
     }
   });
 
@@ -275,16 +275,30 @@ async function runPooledTurn({
   }
 
   return await new Promise((resolveTurn, rejectTurn) => {
+    let settleTimer = null;
+    const clearSettleTimer = () => {
+      if (settleTimer) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+    };
     const fail = (err) => {
       if (settled) return;
       settled = true;
+      clearSettleTimer();
       runtime.activeTurn = null;
       controller.signal.removeEventListener('abort', onAbort);
+      if (err && typeof err === 'object') {
+        err.stderr = turnStderr;
+        err.exitCode = runtime.exitInfo?.code ?? runtime.child.exitCode ?? null;
+        err.settledToolCount = mapper.getState().settledToolCount;
+      }
       rejectTurn(err);
     };
     const succeed = () => {
       if (settled) return;
       settled = true;
+      clearSettleTimer();
       runtime.activeTurn = null;
       controller.signal.removeEventListener('abort', onAbort);
       resolveTurn({
@@ -321,8 +335,23 @@ async function runPooledTurn({
         }
         const st = mapper.getState();
         if (st.resultSeen) {
-          if (st.success) succeed();
-          else fail(new Error('agy did not complete successfully'));
+          if (st.success) {
+            clearSettleTimer();
+            settleTimer = setTimeout(() => {
+              if (settled) return;
+              const code = runtime.exitInfo?.code ?? runtime.child.exitCode;
+              if (code !== null && code !== 0) {
+                const snippet = turnStderr ? `: ${turnStderr.slice(-1200)}` : '';
+                const err = new Error(`agy process exited with code ${code}${snippet}`);
+                err.errorCode = 'process_exit_error';
+                fail(err);
+                return;
+              }
+              succeed();
+            }, 50);
+          } else {
+            fail(new Error('agy did not complete successfully'));
+          }
         }
       },
       onError(e) {
@@ -363,7 +392,7 @@ async function runPooledTurn({
 
 /**
  * Executes a single streaming `/run-turn` against agy headless `--output-format stream-json`
- * (or reuses a warm `--input-format stream-json` child when `AGY_PROCESS_POOL=1`).
+ * (or reuses a warm `--input-format stream-json` child when retained or `AGY_PROCESS_POOL=1`).
  */
 export async function runTurnStream({ body, res, config, sessionStore, processPool, onTools, onMcpConfigured }) {
   const runId = 'agy-' + randomUUID();
@@ -494,6 +523,7 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
     const emitSanitizedEvent = buildSanitizedEventEmitter(emitEventRaw, localPdfReplacements);
     const canUsePool = Boolean(
       processPool?.enabled &&
+        (processPool.isRetained(key) || config.processPoolAlways) &&
         !hasLocalPdfTurn &&
         metadata.forceFreshSession !== true &&
         effectivePermissionMode !== 'plan'
@@ -511,70 +541,116 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
         mcpSettingsFile,
         readDirs: built.extraAddDirs
       });
-      let poolEntry = processPool.get(key);
-      const isLiveSameSignature = Boolean(
-        poolEntry &&
-          poolEntry.child &&
-          !poolEntry.meta?.closed &&
-          poolEntry.child.exitCode === null &&
-          poolEntry.child.signalCode === null &&
-          poolEntry.meta?.signature === poolSignature
+      const poolPrintTimeoutSec = Math.max(
+        Math.ceil(timeoutMs / 1000),
+        Math.ceil(((config.poolMaxProcessAgeMs || 1_500_000) + 60_000) / 1000)
       );
-      if (!isLiveSameSignature) {
-        if (poolEntry) processPool.invalidate(key);
-        const poolArgs = [
-          '--input-format',
-          'stream-json',
-          '--output-format',
-          'stream-json',
-          '--print=',
-          '--print-timeout',
-          printTimeoutFlag,
-          '--disable-slash-commands'
-        ];
-        if (oldId) poolArgs.push('--conversation', oldId);
-        if (model && model !== 'default') poolArgs.push('--model', model);
-        if (effort && effort !== 'default') poolArgs.push('--effort', effort);
-        poolArgs.push(...permFlags);
-        if (mcpSettingsFile) poolArgs.push('--settings', mcpSettingsFile);
-        for (const dir of built.extraAddDirs) poolArgs.push('--add-dir', dir);
 
-        poolEntry = createPooledChildRuntime({
-          key,
-          poolSignature,
-          spawnArgs: poolArgs,
-          cwd,
-          config,
-          processPool,
-          sessionId: oldId
-        });
-      } else {
-        processPool.touch(key);
-        processPool.setBusy(key, true);
-      }
+      for (let attempt = 0; attempt <= config.rateLimitMaxRetries; attempt += 1) {
+        let poolEntry = processPool.isReusable(key, poolSignature) ? processPool.get(key) : null;
+        if (!poolEntry) {
+          if (processPool.get(key)) processPool.invalidate(key, { keepRetained: true });
+          const poolArgs = [
+            '--input-format',
+            'stream-json',
+            '--output-format',
+            'stream-json',
+            '--print=',
+            '--print-timeout',
+            `${poolPrintTimeoutSec}s`,
+            '--disable-slash-commands'
+          ];
+          if (oldId) poolArgs.push('--conversation', oldId);
+          if (model && model !== 'default') poolArgs.push('--model', model);
+          if (effort && effort !== 'default') poolArgs.push('--effort', effort);
+          poolArgs.push(...permFlags);
+          if (mcpSettingsFile) poolArgs.push('--settings', mcpSettingsFile);
+          for (const dir of built.extraAddDirs) poolArgs.push('--add-dir', dir);
 
-      child = poolEntry.child;
-      const pooledResult = await runPooledTurn({
-        entry: poolEntry,
-        prompt: built.prompt,
-        runId,
-        model,
-        config,
-        controller,
-        timeoutMs,
-        emitSanitizedEvent,
-        onTools
-      });
-      state = pooledResult.state;
-      stderr = pooledResult.stderr;
-      exitInfo = pooledResult.exitInfo;
-      if (pooledResult.latestCumulativeUsage) {
-        poolEntry.cumulativeUsage = pooledResult.latestCumulativeUsage;
+          poolEntry = createPooledChildRuntime({
+            key,
+            poolSignature,
+            spawnArgs: poolArgs,
+            cwd,
+            config,
+            processPool,
+            sessionId: oldId
+          });
+        } else {
+          processPool.touch(key);
+          processPool.setBusy(key, true);
+        }
+
+        child = poolEntry.child;
+        try {
+          const pooledResult = await runPooledTurn({
+            entry: poolEntry,
+            prompt: built.prompt,
+            runId,
+            model,
+            config,
+            controller,
+            timeoutMs,
+            emitSanitizedEvent,
+            onTools
+          });
+          state = pooledResult.state;
+          stderr = pooledResult.stderr;
+          exitInfo = pooledResult.exitInfo;
+          processPool.setBusy(key, false);
+          processPool.recordTurn(key, {
+            sessionId: state.sessionId,
+            cumulativeUsage: pooledResult.latestCumulativeUsage
+          });
+          break;
+        } catch (err) {
+          stderr = err?.stderr || stderr;
+          if (err?.exitCode !== undefined && err.exitCode !== null) {
+            exitInfo = { code: err.exitCode, signal: null };
+          }
+          processPool.invalidate(key, { keepRetained: true });
+          child = null;
+
+          if (timedOut || controller.signal.aborted) {
+            throw err;
+          }
+          const classified = classifyAgyError(err?.message || err, stderr, exitInfo.code, [config.token]);
+          if (
+            classified.code === 'rate_limited' &&
+            (err?.settledToolCount ?? 0) === 0 &&
+            attempt < config.rateLimitMaxRetries
+          ) {
+            emitEventRaw({
+              type: 'status',
+              text: `Rate limit (429) encountered; retrying turn after backoff (${attempt + 1}/${config.rateLimitMaxRetries})...`
+            });
+            await new Promise((resolveDelay) => {
+              const delayMs = config.rateLimitRetryDelayMs * (attempt + 1);
+              const t = setTimeout(() => {
+                controller.signal.removeEventListener('abort', onBackoffAbort);
+                resolveDelay();
+              }, delayMs);
+              const onBackoffAbort = () => {
+                clearTimeout(t);
+                resolveDelay();
+              };
+              controller.signal.addEventListener('abort', onBackoffAbort, { once: true });
+            });
+            if (timedOut) {
+              const toErr = new Error(`agy turn timed out after ${timeoutMs}ms`);
+              toErr.errorCode = 'timeout';
+              throw toErr;
+            }
+            if (controller.signal.aborted) {
+              const abErr = new Error('cancelled');
+              abErr.errorCode = 'cancelled';
+              throw abErr;
+            }
+            continue;
+          }
+          throw err;
+        }
       }
-      if (state.sessionId) {
-        poolEntry.sessionId = state.sessionId;
-      }
-      processPool.setBusy(key, false);
     } else {
       if (processPool?.get(key)) {
         processPool.invalidate(key);
@@ -752,7 +828,7 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
     });
   } catch (e) {
     if (usingPooledRuntime && key) {
-      processPool.invalidate(key);
+      processPool.invalidate(key, { keepRetained: true });
     }
     if (timedOut) {
       if (!res.destroyed) emitFallback('agy turn timed out', 'timeout');
@@ -767,7 +843,7 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
     clearTimeout(timer);
     if (child && !success) {
       if (usingPooledRuntime && key) {
-        processPool.invalidate(key);
+        processPool.invalidate(key, { keepRetained: true });
       } else {
         killProcessTree(child);
       }

@@ -9,9 +9,9 @@
 
 | Suite / Command | Scope | Pass / Total | Notes |
 | --- | --- | --- | --- |
-| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 29 / 29 | Runs offline inside sandbox (real `agy 1.5.9` variant-to-base-model grouping, `splitModelVariant` & `resolveAgyModelAndEffort`, `parseClaudeShimArgs` & `ensureWindowsClaudeCmdShim`, managed bridge CLI flags, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, M5-01 multimodal image materialization & `view_file(<dir>)`, M5-02 30+ paper scope manifest & tail-safe JSON compaction, M7-02 local EN/CJK semantic embedding L2 norm/similarity/disk cache & upstream 429 batch proxy, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, `normalizeCumulativeUsage` & `SessionProcessPool`) |
+| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 29 / 29 | Runs offline inside sandbox (real `agy 1.5.9` variant-to-base-model grouping, `splitModelVariant` & `resolveAgyModelAndEffort`, `parseClaudeShimArgs` & `ensureWindowsClaudeCmdShim`, managed bridge CLI flags, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, M5-01 multimodal image materialization & `view_file(<dir>)`, M5-02 30+ paper scope manifest & tail-safe JSON compaction, M7-02 local EN/CJK semantic embedding L2 norm/similarity/disk cache & upstream 429 batch proxy, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, default `processPoolEnabled` config, `normalizeCumulativeUsage`, `SessionProcessPool` LRU/TTL/max-turns rotation with `keepRetained`) |
 | `npm run test:bundle` | Single-file release bundle (`test/bundle.test.mjs`) | 3 / 3 | Verifies `dist/agy-zotero-bridge.mjs` exported surface (including M5 & M7-02 exports), CLI `--version` / `--help`, and SDK stdio `initialize` / `set_model` |
-| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/bundle.test.mjs` + `test/unit.test.mjs`) | 58 / 58 | Original 10 baseline integration tests + 16 integration tests (including M4 pooled PID reuse, `(model, effort)` normalization, `claude-code-agy.mjs` SDK stdio E2E, managed `bridge.mjs` lifecycle, M5-01 multimodal SDK image materialization, M5-02 transient 429 retry backoff, and M7-02 `/v1/embeddings` HTTP endpoint + LRU cache) + 3 bundle tests + 29 unit tests |
+| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/bundle.test.mjs` + `test/unit.test.mjs`) | 58 / 58 | Original 10 baseline integration tests + 16 integration tests (including M7-01 default retention PID reuse, `AGY_PROCESS_POOL=0` opt-out & `AGY_POOL_MAX_TURNS=2` rotation, `(model, effort)` normalization, `claude-code-agy.mjs` SDK stdio E2E, managed `bridge.mjs` lifecycle, M5-01 multimodal SDK image materialization, M5-02 transient 429 retry backoff, and M7-02 `/v1/embeddings` HTTP endpoint + LRU cache) + 3 bundle tests + 29 unit tests |
 
 ### Original 10 Baseline Integration Tests (`test/bridge.test.mjs`)
 1. `health and model discovery match plugin contract` — PASS
@@ -36,7 +36,7 @@
 18. `token auth prefix, model banner stripping, and Zotero MCP probe work end-to-end` — PASS
 19. `healthz advertises local_pdf_paths and run-turn validates and redacts localDocuments paths` — PASS
 20. `mcp-servers handles 401 before turn and captures Bearer token + tools during Zotero run-turn` — PASS
-21. `runtime-retention, invalidate-session, and invalidate-all-hot-runtimes respect pool opt-in` — PASS
+21. `runtime-retention, invalidate-session, and invalidate-all-hot-runtimes support default retention, opt-out, and turn rotation` — PASS
 22. `run-turn and efforts normalize base models, legacy suffixed variants, and auto effort cleanly` — PASS
 23. `claude-code-agy.mjs speaks Claude Code CLI stream-json protocol for direct Claude Code path use` — PASS
 24. `bridge.mjs supports managed CLI flags, ADAPTER_AUTH_TOKEN, CLAUDE_BRIDGE_READY, and stdin close exit` — PASS
@@ -63,10 +63,10 @@ Verified against the user's live Windows machine:
 | --- | --- | --- | --- |
 | Live Managed Zotero mode via **Claude Code path** (`claude-code-agy.mjs`) | Ready for UI test (mock/SDK protocol verified) | Zotero built-in bridge manages startup automatically when *Use my own bridge* is off | Set **Claude Code path** to `<repo>\claude-code-agy.mjs`, uncheck *Use my own bridge*, click **Restart bridge** & Refresh models |
 | Live Zotero Note/Tag direct write (`note_write`, tags) & readback | Ready in `v1.0.0` (`writeEnabled: true` default) | User authorized removing default read-only restriction; mock/unit verified | Restart bridge, test creating/appending a note or adding a tag on a target item in Zotero UI and check readback confirmation |
-| Live multi-turn persistent daemon pool reuse (`AGY_PROCESS_POOL=1`) | Opt-in / mock-verified | `AGY_PROCESS_POOL` defaults to `0` (`v0` one-process-per-turn); `--input-format stream-json` CLI args verified on `agy.exe 1.5.9` | Start bridge with `$env:AGY_PROCESS_POOL="1"` across multiple Zotero turns in one conversation |
+| Live multi-turn persistent daemon pool reuse (`M7-01` default retention & SDK warm shim) | Enabled by default / mock-verified | Default retention-aware pooling (`AGY_PROCESS_POOL` unset) + `--input-format stream-json` + `AGY_POOL_MAX_TURNS` rotation verified in automated tests and `--input-format stream-json` flags checked on `agy.exe 1.5.9` | Run multiple consecutive follow-up turns in an open Zotero chat tab (either Managed or Custom Bridge mode) and observe TTFT improvement without cold-start stalls |
 
 ## 4. Rollback Plan
 
 - Stop `node .\bridge.mjs` (`Ctrl+C`).
-- To restore strict read-only MCP protection immediately, launch with `$env:AGY_ZOTERO_MCP_ALLOW_WRITE="0"`; leave `AGY_PROCESS_POOL` unset to stay on independent per-turn processes.
+- To restore strict read-only MCP protection immediately, launch with `$env:AGY_ZOTERO_MCP_ALLOW_WRITE="0"`; set `$env:AGY_PROCESS_POOL="0"` to force independent per-turn cold processes.
 - `sessions.json` format is unchanged; no global `agy` settings (`~/.gemini/config/mcp_config.json`, `~/.gemini/antigravity-cli/settings.json`) or Zotero plugin files were modified.

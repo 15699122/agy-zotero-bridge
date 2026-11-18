@@ -261,11 +261,12 @@ agy 官方文档需核对所安装版本：
      - 在 `src/context/prompt-builder.mjs` 首轮系统指令注入阶段自动加载用户模板，并要求在写回后执行结构化校验。
 
 ### 方向 C：性能深化与语义检索扩展（`M7`）
-1. **`M7-01` 常驻进程池默认化与首字时延调优**：
+1. **`M7-01` 常驻进程池默认化与首字时延调优（✅ 已完成并验证）**：
    - **目标**：在多轮连续追问场景下降低 `agy.exe` 冷启动开销，缩短首字响应时间（TTFT）。
-   - **大致开发内容**：
-     - 对 `SessionProcessPool`（`src/agy/process-pool.mjs`）在 Windows 托管模式下的内存占用、空闲自动回收（TTL）及异常崩塌隔离进行长时压测。
-     - 评估并制定安全的默认开启条件（如仅对同一会话连续对话保持温启动，切换文献库或模型时自动重建）。
+   - **已实现内容**：
+     - **`SessionProcessPool` 生命周期治理与默认保留机制（`src/config.mjs`、`src/agy/process-pool.mjs`、`src/http/server.mjs`）**：`processPoolEnabled` 默认开启（仅在 `AGY_PROCESS_POOL=0` 时关闭），新增 `processPoolAlways`（`AGY_PROCESS_POOL=1` 强制对未挂载会话也启用池化）、`maxTurnsPerProcess`（`AGY_POOL_MAX_TURNS`，默认 `20`）与 `maxProcessAgeMs`（`AGY_POOL_MAX_AGE_MS`，默认 `25m`）。新增 `isReusable()`、`recordTurn()` 轮次/寿命自动轮换及 `invalidate(key, { keepRetained })`，在进程轮换或异常恢复时保留 `/runtime-retention` 订阅态而不泄漏退出进程；`GET /healthz` 暴露 `processPool` 配置快照。
+     - **HTTP Bridge 挂载感知与 CLI `--print-timeout` 防护（`src/agy/process-runner.mjs`、`bridge.mjs`）**：`canUsePool` 基于 `(processPool.isRetained(key) || config.processPoolAlways)` 激活复用，即 Zotero 挂载对话标签页（`/runtime-retention` `retain: true`）自动复用常驻 `--input-format stream-json` 进程并在关闭标签页（`retain: false`）时立刻回收，而无状态一次性请求继续保持洁净冷启动；`poolPrintTimeoutSec` 自动高于 `poolMaxProcessAgeMs + 60s` 以防 CLI 提前切断长驻进程，`bridge.mjs` 退出路径调用 `app.close()` 彻底销毁残留子进程树。
+     - **Direct `Claude Code path` SDK 暖子进程复用（`src/claude-sdk/cli-shim.mjs`）**：为 Managed 模式补齐 `warmRuntime` 长驻 `--input-format stream-json` 复用、配置签名隔离、累计用量 `normalizeCumulativeUsage` 增量归一化、轮次/寿命自动轮换与 429 退避重试，并在 `interrupt`、`plan`、`--json-schema`、`--no-session-persistence` 或 stdin 关闭时干净销毁。
 2. **`M7-02` 本地语义向量检索桥接（✅ 已完成并验证）**：
    - **目标**：增强海量本地文献库中的模糊语义检索能力，辅助 Zotero 现有关键词搜索。
    - **已实现内容**：
@@ -299,21 +300,21 @@ agy 官方文档需核对所安装版本：
    - **首轮无污染注入**：仅在非续接首轮通过 `src/context/prompt-builder.mjs` 注入模板约定，同时在 `rules/AGENTS.md` 中保留“仅在用户显式请求写笔记或打标签时生效”、“先通过 `library_search` 复用现有标签与集合避免重复创建”、“写后立刻 `library_read`/`file_io` 回读核验”四项安全守则。
    - **范围保护**：当用户请求的是“仅保存原回答（`sourceMessageId`）”或“仅导出某张图表裁剪（figure-only）”时，桥接器提示词明确禁止强行套用完整精读模板。
 
-### 9.2 `M7-01` 常驻进程池默认化与首字时延（TTFT）调优研究
+### 9.2 `M7-01` 常驻进程池默认化与首字时延（TTFT）调优（✅ 已实现并验证）
 
 1. **双拓扑运行态对比（Managed CLI Shim vs Custom HTTP Bridge）**：
    - **Managed 模式（`claude-code-agy.mjs` / `dist/agy-zotero-bridge.mjs` + Zotero `content/claude-bridge/bridge.mjs`）**：
      - 经核查 `content/claude-bridge/bridge.mjs`，上游自带 `hotRuntimePool`（通过 `startHotTurn`、`retainHotRuntime`、`warmHotRuntime` 与 `/runtime-retention` 控制生命周期），可将 `claude-code-agy.mjs` 进程本身保持为 stdio 常驻热进程。
-     - 但目前 `cli-shim.mjs` 的 `executeTurn()` 在每一轮内部仍对 `agy.exe` 采用短生命周期 `-p ... --conversation <id>` 单轮拉起方式，未复用 `agy.exe` 本身的 `--input-format stream-json --output-format stream-json --print=` 长驻子进程。
+     - 本轮已在 `src/claude-sdk/cli-shim.mjs` 中完成 `warmRuntime` 长驻复用实现：连续 `user` 轮次自动复用 `--input-format stream-json --output-format stream-json --print=` 热子进程，在首轮完成 MCP/CLI 初始化与提示词预热，后续追问直接经 stdin JSONL 投递（免去进程冷启开销）。
    - **Custom HTTP Bridge 模式（`bridge.mjs --bridge`）**：
-     - 桥接器已实现基于 `SessionProcessPool`（`src/agy/process-pool.mjs`）的 M4 进程池（`AGY_PROCESS_POOL=1` 时启用），通过 `conversationKey` 复用热 `agy.exe` 子进程，使用 `normalizeCumulativeUsage()` 处理累计 token 转增量 delta。
-2. **每轮 `X-LLM-For-Zotero-Scope` 热轮换兼容性机制（重要发现）**：
+     - `SessionProcessPool`（`src/agy/process-pool.mjs`）已默认开启挂载感知池化（`AGY_PROCESS_POOL` 未设为 `'0'` 时启用）：当 Zotero 对话标签页触发 `POST /runtime-retention`（`retain: true`）后，同一会话连续多轮自动复用热 `agy.exe` 子进程；一次性无挂载请求仍采用短生命周期 `-p` 调用，避免 Windows 下游测试/临时目录句柄滞留。设置 `AGY_PROCESS_POOL=1` 可强制对未挂载请求也开启池化，`AGY_PROCESS_POOL=0` 可彻底回退冷启动。
+2. **每轮 `X-LLM-For-Zotero-Scope` 热轮换兼容性机制**：
    - 核查 `zotero-llm` 源码确认：`X-LLM-For-Zotero-Scope` 请求头是每轮动态生成、回合结束即失效的临时作用域令牌，且在工具调用中通过 HTTP Header 传给 `http://127.0.0.1:23119/llm-for-zotero/mcp`。
    - **为什么常驻 `agy.exe` 无需因此重启**：桥接器每轮在写入 stdin `user` 消息前先调用 `prepareScopedMcpPlugin()` 覆盖更新 `<cwd>/.agents/zotero-mcp-headers.json`，而 `src/mcp/stdio-http-proxy.mjs` 在 `runProxy()` 每次收到来自 `agy.exe` 的 JSON-RPC 请求时都会重新执行 `loadProxyTarget()` 读取最新 `zotero-mcp-headers.json`。因此常驻 `agy.exe` + 常驻 stdio proxy 组合**天然支持跨轮 Scope Token 热更新**。
-3. **默认化前必须满足的三项安全/工程约束**：
-   - **约束 1：完整配置签名隔离（已在本轮修复）**：除 `cwd/model/effort/permissionMode/allowWriteForTurn` 外，`mcpSettingsFile` 与 `readDirs`（`--add-dir`）变化时必须触发 `poolSignature` 失效并重建 `agy.exe`（已在 `src/agy/process-runner.mjs` 修复补充）；`plan` 模式或 `localDocuments` 原生 PDF 轮次必须继续绕过池化以确保强隔离。
-   - **约束 2：`--print-timeout` 作用域陷阱**：实测 `agy.exe 1.5.9` 传入 `--input-format stream-json --print-timeout <T>` 时，该超时若作用于常驻进程总存活时长或空转上限，长期挂机可能导致暖进程意外退出；默认化前需在 `poolSignature` / `createPooledChildRuntime` 中配合最大存活轮次/最大生命周期轮换（例如达到 20 轮或接近 TTL 时优雅回收重拉），并将单轮超时严格交由桥接器 `AbortController` 控制。
-   - **约束 3：取消与异常崩溃防重放隔离**：当某轮发生网络中断、客户端 `abort` 或 429 重试切换时，必须立即 `killProcessTree` 并 `processPool.invalidate(key)`，严禁在已发生过工具副作用（`settledToolCount > 0`）的脏进程上静默续跑。
+3. **三项工程隔离与轮换约束（已全部落地）**：
+   - **约束 1：完整配置签名隔离**：`poolSignature` / `shimSignature` 纳入 `cwd/model/effort/permissionMode/allowWriteForTurn/mcpSettingsFile/readDirs`，变更即安全重建；`plan`、`--json-schema`、`--no-session-persistence` 及 `localDocuments` 原生 PDF 轮次自动绕过池化。
+   - **约束 2：`--print-timeout` 与轮次/寿命自动轮换**：`poolPrintTimeoutSec` 自动高于 `poolMaxProcessAgeMs + 60s`（默认 25 分钟），并配合 `AGY_POOL_MAX_TURNS`（默认 `20`）与 `AGY_POOL_MAX_AGE_MS`（默认 `25m`）优雅回收重拉；轮换时通过 `{ keepRetained: true }` 保持 Zotero 标签页挂载状态不断档。
+   - **约束 3：取消、崩溃与停机彻底清理**：单轮超时严格交由 `AbortController` 控制，发生 429 重试（`settledToolCount === 0`）、断开取消、崩溃或 `bridge.mjs` / `cli-shim.mjs` 退出时立即触发 `killProcessTree` / `app.close()` 清理整棵 Windows 子进程树。
 
 ### 9.3 `M7-02` 本地语义向量检索桥接（Semantic Search Bridge ✅ 已实现并验证）
 

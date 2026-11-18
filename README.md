@@ -4,7 +4,7 @@ Standalone, zero-dependency Node 20+ integration that drives the official Antigr
 1. **Managed Mode (Direct `Claude Code path` — No manual server needed)**: Fill `<repo>\claude-code-agy.mjs` (or `claude-code-agy.cmd` on Windows) directly into Zotero Settings → **Agent** → **Advanced** → **Claude Code path**, and leave **Use my own bridge** unchecked. Zotero automatically launches and manages the runtime!
 2. **Custom Bridge Mode (`Use my own bridge`)**: Run `node .\bridge.mjs` yourself and point Zotero's Bridge URL to `http://127.0.0.1:8765`.
 
-Both modes provide grouped base-model discovery + independent Thinking Level (`effort`) selection, Zotero MCP read & direct write capabilities (`writeEnabled: true` by default; `plan` mode / `AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), ephemeral per-turn `--settings` permissions, workspace plugin rules, `local_pdf_paths` support, structured completion, and opt-in M4 persistent pooling.
+Both modes provide grouped base-model discovery + independent Thinking Level (`effort`) selection, Zotero MCP read & direct write capabilities (`writeEnabled: true` by default; `plan` mode / `AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), ephemeral per-turn `--settings` permissions, workspace plugin rules, `local_pdf_paths` support, structured completion, local semantic embeddings (`/v1/embeddings`), and default retention-aware persistent `stdin stream-json` process pooling (`AGY_PROCESS_POOL=0` opt-out).
 
 ## 1. Quick Setup (Windows / PowerShell)
 
@@ -77,7 +77,7 @@ agy-zotero-bridge/
 │   ├── claude-sdk/cli-shim.mjs    # Claude Code CLI/SDK stdio stream-json & control_request shim
 │   ├── http/server.mjs            # HTTP routing, token auth, JSON/NDJSON responses
 │   ├── agy/cli-probe.mjs          # Version, model banner parsing, effort & health probes
-│   ├── agy/process-pool.mjs       # Opt-in M4 pool retention, LRU/TTL eviction, usage delta normalization
+│   ├── agy/process-pool.mjs       # Default retention-aware M4/M7 pool, LRU/TTL & turn/age rotation, usage deltas
 │   ├── agy/process-runner.mjs     # /run-turn, /structured-completion, Windows taskkill tree cleanup
 │   ├── embedding/embedding-service.mjs # M7-02 OpenAI /v1/embeddings bridge (local semantic + upstream cache)
 │   ├── protocol/event-mapper.mjs  # agy stream-json -> RuntimeEvent mapper & error classifier
@@ -121,9 +121,11 @@ agy-zotero-bridge/
 | `ZOTERO_MCP_URL` | `http://127.0.0.1:23119/llm-for-zotero/mcp` | Local `llm-for-zotero` JSON-RPC 2.0 MCP endpoint |
 | `ZOTERO_MCP_TOKEN` | unset | Optional Bearer token for standalone `/mcp-servers?probe=1` checks (auto-captured during Zotero `/run-turn`) |
 | `AGY_ZOTERO_MCP_ALLOW_WRITE` | `1` (enabled) | Set `0` to enforce strict read-only Zotero MCP mode (`writeEnabled: false`) |
-| `AGY_PROCESS_POOL` | unset (`0`) | Set `1` to enable M4 persistent `stdin stream-json` process reuse across turns |
-| `AGY_POOL_MAX_SIZE` | `4` | Max retained warm processes when `AGY_PROCESS_POOL=1` |
+| `AGY_PROCESS_POOL` | unset (retention-aware default) | Retention-aware pooling & SDK warm child reuse enabled by default; set `0` to disable or `1` to force pooling on unmounted HTTP turns |
+| `AGY_POOL_MAX_SIZE` | `4` | Max concurrent retained warm processes in `SessionProcessPool` |
 | `AGY_POOL_IDLE_TTL_MS` | `300000` (5m) | Idle timeout before evicting warm pooled processes |
+| `AGY_POOL_MAX_TURNS` | `20` | Max turns per warm child process before automatic clean rotation |
+| `AGY_POOL_MAX_AGE_MS` | `1500000` (25m) | Max warm process age (ms) before automatic clean rotation |
 | `AGY_TURN_TIMEOUT_MS` | `1800000` (30m) | Default `/run-turn` timeout cap |
 | `AGY_STRUCTURED_TIMEOUT_MS` | `120000` (2m) | Default `/structured-completion` timeout cap |
 | `AGY_RATE_LIMIT_MAX_RETRIES` | `1` | Max automatic backoff retries on pre-tool-execution HTTP 429 |
@@ -141,7 +143,7 @@ agy-zotero-bridge/
 
 | Route | Status | Behavior |
 | --- | --- | --- |
-| `GET /healthz` | ✅ | Separates `bridgeAlive`, `agyInstalled`, `agyVersion`, `agyAuthenticated: null` (`authStatus: 'unverified'`), capabilities |
+| `GET /healthz` | ✅ | Separates `bridgeAlive`, `agyInstalled`, `agyVersion`, `agyAuthenticated: null` (`authStatus: 'unverified'`), `processPool` status, `embeddings`, and capabilities |
 | `GET /models` | ✅ | Runs `agy --output-format json models` (with plaintext fallback), strips status banners, returns `models` + `modelInfos` |
 | `GET /efforts` | ✅ | Returns model-aware efforts (`?model=<id>`) and `byModel`; unknown models conservatively return `['default']` |
 | `GET /tools` | ✅ | Returns `agy` native tools + discovered MCP tools classified with explicit read/write/confirmation metadata |
@@ -150,15 +152,15 @@ agy-zotero-bridge/
 | `GET /session-info` | ✅ | Returns scoped key, provider session ID, and contained workspace `cwd` |
 | `GET /account-quota` | ✅ | Returns `{ quota: null }` |
 | `GET /mcp-servers` | ✅ | Returns empty list + setup snippet until Zotero turn / `?probe=1`; reports `writeEnabled: true` by default |
-| `POST /run-turn` | ✅ | NDJSON `start` → `event` → `outcome`; supports one-shot `-p` default and M4 persistent `--input-format stream-json` reuse (`AGY_PROCESS_POOL=1`), `finished_reason` guards, ephemeral `--settings`, timeouts, Windows kill, redaction |
+| `POST /run-turn` | ✅ | NDJSON `start` → `event` → `outcome`; automatically reuses warm `--input-format stream-json` workers for retained tabs (`AGY_PROCESS_POOL=1` forces all turns, `AGY_PROCESS_POOL=0` disables), `finished_reason` guards, ephemeral `--settings`, timeouts, Windows kill, redaction |
 | `POST /structured-completion` | ✅ | Stateless non-session text/JSON-schema completion via `--json-schema`, enforcing `timeoutMs` and client abort |
 | `POST /v1/embeddings`, `/embeddings`, `GET /v1/embeddings/status` | ✅ | OpenAI-compatible embedding endpoint with zero-dependency bilingual local semantic hashing, SHA-256 disk cache, and upstream batch/429 proxy |
 | `POST /invalidate-session` | ✅ | Removes scoped session mapping, kills/invalidates any pooled process, and saves atomically |
-| `POST /runtime-retention`, `/invalidate-all-hot-runtimes` | ✅ | Honors `AGY_PROCESS_POOL=1` retention & bulk invalidation (`retained: false` when pool disabled) |
+| `POST /runtime-retention`, `/invalidate-all-hot-runtimes` | ✅ | Default retention-aware lifecycle management & bulk invalidation (`retained: false` when `AGY_PROCESS_POOL=0`) |
 | `POST /run-action`, `/resolve-confirmation` | ⛔ `501` | Returns `501 unsupported_by_agy_headless_v0` (interactive mid-turn approval callbacks are not supported in `agy` print mode) |
 
 ## 6. Known Boundaries & Rollback
 
-- **Automated vs Live E2E**: All **50** automated tests (`26` unit + `24` integration) verify protocol, `claude-code-agy.mjs` direct `Claude Code path` SDK stdio shim, managed `bridge.mjs` CLI flags (`--port 0`, `--zotero-root`, `--exit-on-stdin-close 1`, `ADAPTER_AUTH_TOKEN`, `CLAUDE_BRIDGE_READY`), grouped base-model / `effort` resolution, `finished_reason` truncation safety, security, cancellation, `local_pdf_paths`, MCP auth/settings/rules injection, default Zotero write support (`AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), M4 persistent `stdin stream-json` PID reuse + cumulative usage deltas, and error behavior against mock CLI/MCP endpoints. Live Windows E2E on Zotero `10.0.8` + `llm-for-zotero v3.9.19` + `agy.exe 1.5.9` has passed for `models`, `/structured-completion`, `/mcp-servers?probe=1`, library search, single-paper close reading & experiment analysis, cross-paper comparison, and grouped model/reasoning separation in **Use my own bridge** mode. Live Zotero Managed mode via **Claude Code path** (`claude-code-agy.mjs`), live Zotero write execution (`note_write` / tag updates), and live `AGY_PROCESS_POOL=1` long-run multi-turn reuse should now be exercised directly in Zotero UI.
-- **Process Execution Default**: Default mode remains safe one-process-per-turn (`AGY_PROCESS_POOL` unset); set `AGY_PROCESS_POOL=1` to enable persistent `stdin stream-json` multi-turn reuse.
-- **Rollback**: Stop `bridge.mjs`, set `$env:AGY_ZOTERO_MCP_ALLOW_WRITE="0"` to restore strict read-only MCP enforcement, unset `AGY_PROCESS_POOL` to return to stateless one-process-per-turn execution, or switch `llm-for-zotero` back from *Use my own bridge* to its built-in backend.
+- **Automated vs Live E2E**: All **58** automated tests (`29` unit + `3` bundle + `26` integration) verify protocol, `claude-code-agy.mjs` direct `Claude Code path` SDK stdio shim (including M7-01 warm `stdin stream-json` worker reuse), managed `bridge.mjs` CLI flags (`--port 0`, `--zotero-root`, `--exit-on-stdin-close 1`, `ADAPTER_AUTH_TOKEN`, `CLAUDE_BRIDGE_READY`), grouped base-model / `effort` resolution, `finished_reason` truncation safety, security, cancellation, `local_pdf_paths`, M5-01 multimodal image materialization, M5-02 30+ paper scope manifests + tail-safe JSON compaction + transient 429 retry, M7-02 `/v1/embeddings` semantic endpoint + LRU cache, MCP auth/settings/rules injection, default Zotero write support (`AGY_ZOTERO_MCP_ALLOW_WRITE=0` opt-out), M7-01 retention-aware `SessionProcessPool` PID reuse / `AGY_POOL_MAX_TURNS` rotation + cumulative usage deltas, and error behavior against mock CLI/MCP endpoints. Live Windows E2E on Zotero `10.0.8` + `llm-for-zotero v3.9.19` + `agy.exe 1.5.9` has passed for `models`, `/structured-completion`, `/mcp-servers?probe=1`, library search, single-paper close reading & experiment analysis, cross-paper comparison, and grouped model/reasoning separation in **Use my own bridge** mode. Live Zotero Managed mode via **Claude Code path** (`claude-code-agy.mjs`), live Zotero write execution (`note_write` / tag updates), and live multi-turn warm-pool TTFT comparison across extended conversations can now be exercised directly in Zotero UI.
+- **Process Execution Default**: Retention-aware persistent pooling is enabled by default (`AGY_PROCESS_POOL` unset: HTTP bridge pools mounted `/runtime-retention` tabs; SDK shim pools consecutive turns in `Claude Code path`). Set `AGY_PROCESS_POOL=1` to force pooling on unmounted HTTP turns, or `AGY_PROCESS_POOL=0` to revert completely to cold one-process-per-turn invocations.
+- **Rollback**: Stop `bridge.mjs`, set `$env:AGY_ZOTERO_MCP_ALLOW_WRITE="0"` to restore strict read-only MCP enforcement, set `$env:AGY_PROCESS_POOL="0"` to return to stateless one-process-per-turn execution, or switch `llm-for-zotero` back from *Use my own bridge* to its built-in backend.

@@ -15,7 +15,7 @@ if (isMain) {
   const config = createConfig(process.env, process.argv.slice(2));
   delete process.env.ADAPTER_AUTH_TOKEN;
 
-  const { server } = await startBridgeServer(config);
+  const { server, app } = await startBridgeServer(config);
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : config.port;
   console.log(
@@ -31,17 +31,19 @@ if (isMain) {
     })}`
   );
 
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const forceExit = setTimeout(() => process.exit(0), 3000);
+    forceExit.unref();
+    await app.close().catch(() => {});
+    server.close(() => process.exit(0));
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
   if (config.exitOnStdinClose) {
-    let shuttingDown = false;
-    const shutdown = () => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      const forceExit = setTimeout(() => process.exit(0), 3000);
-      forceExit.unref();
-      server.close(() => process.exit(0));
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
     process.stdin.on('end', shutdown);
     process.stdin.on('close', shutdown);
     process.stdin.on('error', shutdown);

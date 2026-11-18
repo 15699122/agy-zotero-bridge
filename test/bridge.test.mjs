@@ -44,8 +44,9 @@ before(async () => {
 });
 
 after(async () => {
+  await post('/invalidate-all-hot-runtimes', {}).catch(() => {});
   child?.kill();
-  await rm(dir, { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 async function post(path, data, baseUrl = base) {
@@ -636,12 +637,39 @@ test('mcp-servers handles 401 before turn and captures Bearer token + tools duri
   }
 });
 
-test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes respect pool opt-in', async () => {
-  // Default server has AGY_PROCESS_POOL disabled -> retained: false
+test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes support default retention, opt-out, and turn rotation', async () => {
+  // Default server enables retention-aware pooling (`processPoolEnabled: true`):
+  // mounted/retained conversations reuse warm processes, then release them on retain: false.
   const defaultRet = await (
     await post('/runtime-retention', { conversationKey: 'pool-conv-1', scopeType: 'paper', scopeId: 'S1', retain: true })
   ).json();
-  assert.equal(defaultRet.retained, false);
+  assert.equal(defaultRet.retained, true);
+
+  const defTurn1Res = await post('/run-turn', {
+    conversationKey: 'pool-conv-1',
+    scopeType: 'paper',
+    scopeId: 'S1',
+    userText: 'MOCK_POOL_INFO'
+  });
+  assert.equal(defTurn1Res.status, 200);
+  const defTurn1Data = JSON.parse((await defTurn1Res.text()).trim().split('\n').map(JSON.parse).at(-1).outcome.text);
+  assert.equal(defTurn1Data.turn, 1);
+
+  const defTurn2Res = await post('/run-turn', {
+    conversationKey: 'pool-conv-1',
+    scopeType: 'paper',
+    scopeId: 'S1',
+    userText: 'MOCK_POOL_INFO'
+  });
+  assert.equal(defTurn2Res.status, 200);
+  const defTurn2Data = JSON.parse((await defTurn2Res.text()).trim().split('\n').map(JSON.parse).at(-1).outcome.text);
+  assert.equal(defTurn2Data.pid, defTurn1Data.pid);
+  assert.equal(defTurn2Data.turn, 2);
+
+  const defaultUnret = await (
+    await post('/runtime-retention', { conversationKey: 'pool-conv-1', scopeType: 'paper', scopeId: 'S1', retain: false })
+  ).json();
+  assert.equal(defaultUnret.retained, false);
 
   const defaultInv = await (
     await post('/invalidate-session', { conversationKey: 'pool-conv-1', scopeType: 'paper', scopeId: 'S1' })
@@ -652,8 +680,45 @@ test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes res
   assert.equal(defaultAll.invalidated, true);
   assert.equal(defaultAll.count, 0);
 
-  // Start an opt-in AGY_PROCESS_POOL=1 instance and verify retention & invalidation
-  const p3 = 17600 + Math.floor(Math.random() * 1500);
+  // Explicit opt-out (`AGY_PROCESS_POOL=0`) disables retention and warm process reuse.
+  const p0 = 17600 + Math.floor(Math.random() * 700);
+  const d0 = await mkdtemp(join(tmpdir(), 'agy-pool-off-'));
+  const c0 = spawn(process.execPath, [bridge], {
+    env: {
+      ...process.env,
+      AGY_BIN: binary,
+      AGY_PREFIX_ARGS_JSON: prefix,
+      AGY_CWD: d0,
+      AGY_BRIDGE_STATE: join(d0, 'sessions.json'),
+      AGY_BRIDGE_PORT: String(p0),
+      AGY_PROCESS_POOL: '0'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  try {
+    const b0 = `http://127.0.0.1:${p0}`;
+    for (let i = 0; i < 60; i++) {
+      try {
+        const r = await fetch(b0 + '/healthz');
+        if (r.ok) break;
+      } catch {
+        // wait
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    const r0 = await (
+      await post('/runtime-retention', { conversationKey: 'pool-off-1', scopeType: 'paper', scopeId: 'S0', retain: true }, b0)
+    ).json();
+    assert.equal(r0.retained, false);
+  } finally {
+    c0.kill();
+    await rm(d0, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+
+  // Forced pool (`AGY_PROCESS_POOL=1`) with max-turns rotation (`AGY_POOL_MAX_TURNS=2`)
+  const p3 = 18350 + Math.floor(Math.random() * 700);
   const d3 = await mkdtemp(join(tmpdir(), 'agy-pool-test-'));
   const c3 = spawn(process.execPath, [bridge], {
     env: {
@@ -663,7 +728,8 @@ test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes res
       AGY_CWD: d3,
       AGY_BRIDGE_STATE: join(d3, 'sessions.json'),
       AGY_BRIDGE_PORT: String(p3),
-      AGY_PROCESS_POOL: '1'
+      AGY_PROCESS_POOL: '1',
+      AGY_POOL_MAX_TURNS: '2'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -720,6 +786,17 @@ test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes res
     assert.equal(poolTurn2Usage.outputTokens, 5);
     assert.equal(poolTurn2Usage.cacheReadInputTokens, 2);
 
+    // Reaching AGY_POOL_MAX_TURNS=2 automatically rotates to a fresh process on turn 3.
+    const poolTurn3RotRes = await post(
+      '/run-turn',
+      { conversationKey: 'conv-pool', scopeType: 'paper', scopeId: 'A1', userText: 'MOCK_POOL_INFO' },
+      b3
+    );
+    assert.equal(poolTurn3RotRes.status, 200);
+    const poolTurn3RotData = JSON.parse((await poolTurn3RotRes.text()).trim().split('\n').map(JSON.parse).at(-1).outcome.text);
+    assert.notEqual(poolTurn3RotData.pid, poolTurn1Data.pid);
+    assert.equal(poolTurn3RotData.turn, 1);
+
     const inv = await (
       await post('/invalidate-session', { conversationKey: 'conv-pool', scopeType: 'paper', scopeId: 'A1' }, b3)
     ).json();
@@ -730,15 +807,15 @@ test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes res
     ).json();
     assert.equal(info.session.providerSessionId, undefined);
 
-    const poolTurn3Res = await post(
+    const poolTurn4Res = await post(
       '/run-turn',
       { conversationKey: 'conv-pool', scopeType: 'paper', scopeId: 'A1', userText: 'MOCK_POOL_INFO' },
       b3
     );
-    const poolTurn3Frames = (await poolTurn3Res.text()).trim().split('\n').map(JSON.parse);
-    const poolTurn3Data = JSON.parse(poolTurn3Frames.at(-1).outcome.text);
-    assert.notEqual(poolTurn3Data.pid, poolTurn1Data.pid);
-    assert.equal(poolTurn3Data.turn, 1);
+    const poolTurn4Frames = (await poolTurn4Res.text()).trim().split('\n').map(JSON.parse);
+    const poolTurn4Data = JSON.parse(poolTurn4Frames.at(-1).outcome.text);
+    assert.notEqual(poolTurn4Data.pid, poolTurn3RotData.pid);
+    assert.equal(poolTurn4Data.turn, 1);
 
     const invAll = await (await post('/invalidate-all-hot-runtimes', {}, b3)).json();
     assert.equal(invAll.invalidated, true);
@@ -746,7 +823,7 @@ test('runtime-retention, invalidate-session, and invalidate-all-hot-runtimes res
   } finally {
     await post('/invalidate-all-hot-runtimes', {}, `http://127.0.0.1:${p3}`).catch(() => {});
     c3.kill();
-    await rm(d3, { recursive: true, force: true });
+    await rm(d3, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
