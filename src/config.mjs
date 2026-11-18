@@ -1,6 +1,6 @@
 import { accessSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 export const BRIDGE_VERSION = 'agy-v1.0.0';
 
@@ -197,6 +197,16 @@ export function createConfig(env = process.env, argv = []) {
     defaultTurnTimeoutMs: Number(env.AGY_TURN_TIMEOUT_MS || 30 * 60 * 1000),
     defaultStructuredTimeoutMs: Number(env.AGY_STRUCTURED_TIMEOUT_MS || 120_000),
     rateLimitMaxRetries: Math.max(0, Math.min(3, Number(env.AGY_RATE_LIMIT_MAX_RETRIES ?? 1))),
-    rateLimitRetryDelayMs: Math.max(50, Math.min(30_000, Number(env.AGY_RATE_LIMIT_RETRY_DELAY_MS ?? 1500)))
+    rateLimitRetryDelayMs: Math.max(50, Math.min(30_000, Number(env.AGY_RATE_LIMIT_RETRY_DELAY_MS ?? 1500))),
+    embeddingProvider: String(env.AGY_EMBEDDING_PROVIDER || 'auto').trim().toLowerCase(),
+    embeddingApiBase: String(env.AGY_EMBEDDING_API_BASE || '').trim().replace(/\/+$/, ''),
+    embeddingApiKey: String(env.AGY_EMBEDDING_API_KEY || '').trim(),
+    embeddingModel: String(env.AGY_EMBEDDING_MODEL || 'agy-local-ngram-v1').trim(),
+    embeddingDimensions: Math.max(16, Math.min(4096, Number(env.AGY_EMBEDDING_DIMENSIONS || 256))),
+    embeddingBatchSize: Math.max(1, Math.min(256, Number(env.AGY_EMBEDDING_BATCH_SIZE || 32))),
+    embeddingCacheFile: expandHomePath(
+      env.AGY_EMBEDDING_CACHE_FILE || join(dirname(stateFile), 'embeddings-cache.json')
+    ),
+    embeddingCacheMaxEntries: Math.max(64, Math.min(20_000, Number(env.AGY_EMBEDDING_CACHE_MAX_ENTRIES || 2048)))
   };
 }

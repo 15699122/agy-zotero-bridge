@@ -26,6 +26,11 @@ import {
 } from '../src/context/prompt-builder.mjs';
 import { buildScopedAgySettings, buildScopedZoteroRulesMarkdown, classifyToolMetadata, prepareScopedMcpPlugin } from '../src/mcp/zotero-mcp.mjs';
 import { forwardJsonRpcMessage } from '../src/mcp/stdio-http-proxy.mjs';
+import {
+  computeLocalSemanticEmbedding,
+  cosineSimilarity,
+  EmbeddingService
+} from '../src/embedding/embedding-service.mjs';
 import { classifyAgyError, createTurnEventMapper } from '../src/protocol/event-mapper.mjs';
 import { redactSensitive, validateLocalFilePath } from '../src/security/redact.mjs';
 import { SessionStore } from '../src/session/session-store.mjs';
@@ -954,6 +959,102 @@ test('M5-02 batch literature scope manifest and tail-safe JSON context compactio
     assert.ok(built.prompt.length <= 8000);
     assert.ok(built.prompt.endsWith('User request:\nFINAL_USER_QUESTION_MUST_SURVIVE'));
     assert.equal(built.paperManifest.length, 32);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('M7-02 local semantic embedding L2 norm, bilingual similarity, disk cache, and upstream 429 batch proxy', async () => {
+  const vecEn1 = computeLocalSemanticEmbedding('ferroptosis inhibition via ROS-GPX4 axis', 256);
+  const vecEn2 = computeLocalSemanticEmbedding('GPX4 and reactive oxygen species in ferroptosis', 256);
+  const vecEnUnrelated = computeLocalSemanticEmbedding('quantum chromodynamics lattice gauge theory', 256);
+
+  assert.equal(vecEn1.length, 256);
+  assert.deepEqual(vecEn1, computeLocalSemanticEmbedding('ferroptosis inhibition via ROS-GPX4 axis', 256));
+  const norm = Math.sqrt(vecEn1.reduce((acc, v) => acc + v * v, 0));
+  assert.ok(Math.abs(norm - 1) < 1e-4, `Expected L2 norm ~ 1.0, got ${norm}`);
+
+  const simEnRelated = cosineSimilarity(vecEn1, vecEn2);
+  const simEnUnrelated = cosineSimilarity(vecEn1, vecEnUnrelated);
+  assert.ok(simEnRelated > 0.35, `Expected English related cosine similarity > 0.35, got ${simEnRelated}`);
+  assert.ok(simEnUnrelated < 0.25, `Expected English unrelated cosine similarity < 0.25, got ${simEnUnrelated}`);
+  assert.ok(simEnRelated > simEnUnrelated * 2, `Expected related (${simEnRelated}) >> unrelated (${simEnUnrelated})`);
+
+  const vecZh1 = computeLocalSemanticEmbedding('抗菌肽修饰钛纳米管药物递送', 256);
+  const vecZh2 = computeLocalSemanticEmbedding('钛纳米管表面抗菌肽涂层控制释放', 256);
+  const simZhRelated = cosineSimilarity(vecZh1, vecZh2);
+  const simZhUnrelated = cosineSimilarity(vecZh1, vecEnUnrelated);
+  assert.ok(simZhRelated > 0.35, `Expected Chinese related cosine similarity > 0.35, got ${simZhRelated}`);
+  assert.ok(simZhUnrelated < 0.25, `Expected Chinese unrelated cosine similarity < 0.25, got ${simZhUnrelated}`);
+  assert.ok(simZhRelated > simZhUnrelated * 2, `Expected Chinese related (${simZhRelated}) >> unrelated (${simZhUnrelated})`);
+
+  const tmpDir = await mkdtemp(join(tmpdir(), 'agy-m7-embed-'));
+  try {
+    const cacheFile = join(tmpDir, 'embeddings-cache.json');
+    const localCfg = createConfig({
+      AGY_CWD: tmpDir,
+      AGY_EMBEDDING_CACHE_FILE: cacheFile,
+      AGY_EMBEDDING_DIMENSIONS: '128'
+    });
+    const svcLocal = new EmbeddingService(localCfg);
+    const out1 = await svcLocal.embed({ input: ['doc alpha', 'doc beta'] });
+    assert.equal(out1.object, 'list');
+    assert.equal(out1.provider, 'local');
+    assert.equal(out1.data.length, 2);
+    assert.equal(out1.data[0].embedding.length, 128);
+    assert.equal(svcLocal.getStatus().stats.cacheMisses, 2);
+
+    const svcReloaded = new EmbeddingService(localCfg);
+    await svcReloaded.load();
+    const out2 = await svcReloaded.embed({ input: 'doc alpha' });
+    assert.deepEqual(out2.data[0].embedding, out1.data[0].embedding);
+    assert.equal(svcReloaded.getStatus().stats.cacheHits, 1);
+
+    // Upstream proxy batch splitting (size=2 for 3 items) + 429 retry backoff
+    let fetchCalls = 0;
+    let firstBatchAttempts = 0;
+    const mockFetch = async (url, init) => {
+      fetchCalls += 1;
+      assert.equal(url, 'https://api.example.test/v1/embeddings');
+      const reqBody = JSON.parse(init.body);
+      if (reqBody.input.length === 2 && firstBatchAttempts === 0) {
+        firstBatchAttempts += 1;
+        return new Response('rate limit exceeded', { status: 429 });
+      }
+      return new Response(
+        JSON.stringify({
+          data: reqBody.input.map((text, idx) => ({
+            index: idx,
+            embedding: [text.length, idx + 0.5]
+          }))
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    const upCfg = createConfig({
+      AGY_CWD: tmpDir,
+      AGY_EMBEDDING_PROVIDER: 'openai',
+      AGY_EMBEDDING_API_BASE: 'https://api.example.test/v1',
+      AGY_EMBEDDING_API_KEY: 'emb-secret-key',
+      AGY_EMBEDDING_MODEL: 'text-embedding-3-small',
+      AGY_EMBEDDING_BATCH_SIZE: '2',
+      AGY_EMBEDDING_CACHE_FILE: join(tmpDir, 'up-cache.json'),
+      AGY_RATE_LIMIT_MAX_RETRIES: '1',
+      AGY_RATE_LIMIT_RETRY_DELAY_MS: '50'
+    });
+    const svcUp = new EmbeddingService(upCfg, { fetchImpl: mockFetch });
+    const upRes = await svcUp.embed({ input: ['a', 'bb', 'ccc'] });
+    assert.equal(fetchCalls, 3);
+    assert.equal(svcUp.getStatus().stats.rateLimitRetries, 1);
+    assert.deepEqual(
+      upRes.data.map((d) => d.embedding),
+      [
+        [1, 0.5],
+        [2, 1.5],
+        [3, 0.5]
+      ]
+    );
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }

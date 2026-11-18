@@ -68,6 +68,9 @@ test('health and model discovery match plugin contract', async () => {
   const h = await (await fetch(base + '/healthz')).json();
   assert.equal(h.protocolVersion, 2);
   assert.ok(h.capabilities.includes('model_catalog_v1'));
+  assert.ok(h.capabilities.includes('embeddings_v1'));
+  assert.equal(h.embeddings.enabled, true);
+  assert.equal(h.embeddings.endpoint, '/v1/embeddings');
   const m = await (await fetch(base + '/models')).json();
   assert.deepEqual(m.models, ['gemini-mock']);
   assert.equal(m.modelInfos[0].displayName, 'Gemini Mock');
@@ -1088,4 +1091,37 @@ test('M5-01 & M5-02: SDK shim materializes multimodal image blocks and HTTP brid
   } finally {
     await rm(imgShimDir, { recursive: true, force: true });
   }
+});
+
+test('M7-02 /v1/embeddings, /embeddings, and /v1/embeddings/status work over HTTP with LRU cache', async () => {
+  const r1 = await post('/v1/embeddings', {
+    model: 'agy-local-ngram-v1',
+    input: ['ferroptosis inhibition via GPX4', 'quantum lattice chromodynamics']
+  });
+  assert.equal(r1.status, 200);
+  const p1 = await r1.json();
+  assert.equal(p1.object, 'list');
+  assert.equal(p1.provider, 'local');
+  assert.equal(p1.data.length, 2);
+  assert.equal(p1.data[0].index, 0);
+  assert.equal(p1.data[1].index, 1);
+  assert.equal(p1.data[0].embedding.length, 256);
+
+  // Repeat call on `/embeddings` alias hits cache cleanly
+  const r2 = await post('/embeddings', {
+    input: 'ferroptosis inhibition via GPX4'
+  });
+  assert.equal(r2.status, 200);
+  const p2 = await r2.json();
+  assert.deepEqual(p2.data[0].embedding, p1.data[0].embedding);
+
+  const statusRes = await fetch(base + '/v1/embeddings/status');
+  assert.equal(statusRes.status, 200);
+  const statusPayload = await statusRes.json();
+  assert.equal(statusPayload.ok, true);
+  assert.ok(statusPayload.stats.cacheHits >= 1);
+  assert.ok(statusPayload.cacheSize >= 2);
+
+  const badRes = await post('/v1/embeddings', { input: [] });
+  assert.equal(badRes.status, 400);
 });

@@ -266,11 +266,13 @@ agy 官方文档需核对所安装版本：
    - **大致开发内容**：
      - 对 `SessionProcessPool`（`src/agy/process-pool.mjs`）在 Windows 托管模式下的内存占用、空闲自动回收（TTL）及异常崩塌隔离进行长时压测。
      - 评估并制定安全的默认开启条件（如仅对同一会话连续对话保持温启动，切换文献库或模型时自动重建）。
-2. **`M7-02` 本地语义向量检索桥接探索**：
+2. **`M7-02` 本地语义向量检索桥接（✅ 已完成并验证）**：
    - **目标**：增强海量本地文献库中的模糊语义检索能力，辅助 Zotero 现有关键词搜索。
-   - **大致开发内容**：
-     - 调研 `llm-for-zotero` 设置中 `embeddingProvider` 与外部嵌入服务的交互接口。
-     - 评估通过桥接器提供标准 OpenAI 兼容 `/v1/embeddings` 代理端点的可行性，实现与 Gemini Embedding 模型的无缝对接。
+   - **已实现内容**：
+     - 在 `src/embedding/embedding-service.mjs` 与 `src/config.mjs` 中实现 `EmbeddingService`、`computeLocalSemanticEmbedding`（零依赖双语中英文/词干/字符 n-gram 签名哈希 + L2 归一化向量引擎）和持久化 SHA-256 LRU 磁盘缓存（`embeddings-cache.json`）。
+     - 在 `src/http/server.mjs` 新增 OpenAI 兼容的 `POST /v1/embeddings`（及 `POST /embeddings` 别名）和 `GET /v1/embeddings/status` 路由；在 `src/agy/cli-probe.mjs` `/healthz` 中广播 `embeddings_v1` 能力。
+     - 支持零密钥开箱本地语义模式，也支持通过 `AGY_EMBEDDING_API_BASE` 透传代理至 OpenAI / Gemini / Ollama 并自动提供分片批处理与 429 指数退避重试。
+     - 已通过 `scripts/bundle.mjs` 集成打包进单文件分发包 `dist/agy-zotero-bridge.mjs`。
 
 ---
 
@@ -313,7 +315,7 @@ agy 官方文档需核对所安装版本：
    - **约束 2：`--print-timeout` 作用域陷阱**：实测 `agy.exe 1.5.9` 传入 `--input-format stream-json --print-timeout <T>` 时，该超时若作用于常驻进程总存活时长或空转上限，长期挂机可能导致暖进程意外退出；默认化前需在 `poolSignature` / `createPooledChildRuntime` 中配合最大存活轮次/最大生命周期轮换（例如达到 20 轮或接近 TTL 时优雅回收重拉），并将单轮超时严格交由桥接器 `AbortController` 控制。
    - **约束 3：取消与异常崩溃防重放隔离**：当某轮发生网络中断、客户端 `abort` 或 429 重试切换时，必须立即 `killProcessTree` 并 `processPool.invalidate(key)`，严禁在已发生过工具副作用（`settledToolCount > 0`）的脏进程上静默续跑。
 
-### 9.3 `M7-02` 本地语义向量检索桥接（Semantic Search Bridge）研究
+### 9.3 `M7-02` 本地语义向量检索桥接（Semantic Search Bridge ✅ 已实现并验证）
 
 1. **上游插件向量配置与调用契约（`llmforzotero.js`）**：
    - 通过核查 `callEmbeddings`、`getResolvedEmbeddingConfig`、`resolveAutoEmbeddingProvider` 与 `orderEmbeddingResponse` 确认：

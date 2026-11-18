@@ -24,6 +24,9 @@ test('single-file bundle exports matches source interface', () => {
   assert.equal(typeof bundle.materializeTurnImages, 'function');
   assert.equal(typeof bundle.extractPaperScopeManifest, 'function');
   assert.equal(typeof bundle.compactRuntimeContext, 'function');
+  assert.equal(typeof bundle.EmbeddingService, 'function');
+  assert.equal(typeof bundle.computeLocalSemanticEmbedding, 'function');
+  assert.equal(typeof bundle.cosineSimilarity, 'function');
   assert.equal(typeof bundle.CliProbe, 'function');
   assert.equal(typeof bundle.SessionStore, 'function');
   assert.equal(typeof bundle.SessionProcessPool, 'function');

@@ -40,6 +40,12 @@ Download `agy-zotero-bridge.mjs` (and optionally `agy-zotero-bridge.cmd`) from [
    ```
 2. Check **Use my own bridge** in `llm-for-zotero` and enter `http://127.0.0.1:8765`.
 
+### Option C: Semantic Search (`POST /v1/embeddings` Bridge)
+1. Start the HTTP bridge (`node .\bridge.mjs` or `node .\agy-zotero-bridge.mjs --bridge`).
+2. In Zotero → **Settings** → **llm-for-zotero** → **Customization / 自定义** → **Semantic Search**:
+   - Enable Semantic Search.
+   - Select **Custom** provider, set **API Base** to `http://127.0.0.1:8765/v1` (leave API Key blank in zero-dependency local semantic mode, or set `AGY_EMBEDDING_API_BASE` + `AGY_EMBEDDING_API_KEY` to proxy with SHA-256 disk caching and automatic 429 retry to Gemini/OpenAI/Ollama), and set **Model** to `agy-local-ngram-v1`.
+
 > **Security notice**: Keep `AGY_BRIDGE_HOST=127.0.0.1` (loopback only). Non-loopback bindings are refused unless `AGY_ALLOW_REMOTE=1` is explicitly set. Never enable `AGY_ALLOW_YOLO=1` unless you explicitly accept unprompted tool execution.
 
 ## 2. Testing & Smoke Verification
@@ -73,6 +79,7 @@ agy-zotero-bridge/
 │   ├── agy/cli-probe.mjs          # Version, model banner parsing, effort & health probes
 │   ├── agy/process-pool.mjs       # Opt-in M4 pool retention, LRU/TTL eviction, usage delta normalization
 │   ├── agy/process-runner.mjs     # /run-turn, /structured-completion, Windows taskkill tree cleanup
+│   ├── embedding/embedding-service.mjs # M7-02 OpenAI /v1/embeddings bridge (local semantic + upstream cache)
 │   ├── protocol/event-mapper.mjs  # agy stream-json -> RuntimeEvent mapper & error classifier
 │   ├── session/session-store.mjs  # Scoped conversation locks & atomic state persistence
 │   ├── context/prompt-builder.mjs # First-turn instructions/skills, localDocuments & Zotero context
@@ -119,6 +126,15 @@ agy-zotero-bridge/
 | `AGY_POOL_IDLE_TTL_MS` | `300000` (5m) | Idle timeout before evicting warm pooled processes |
 | `AGY_TURN_TIMEOUT_MS` | `1800000` (30m) | Default `/run-turn` timeout cap |
 | `AGY_STRUCTURED_TIMEOUT_MS` | `120000` (2m) | Default `/structured-completion` timeout cap |
+| `AGY_RATE_LIMIT_MAX_RETRIES` | `1` | Max automatic backoff retries on pre-tool-execution HTTP 429 |
+| `AGY_RATE_LIMIT_RETRY_DELAY_MS` | `1500` | Base delay (ms) between HTTP 429 retries |
+| `AGY_EMBEDDING_PROVIDER` | `auto` | Embedding backend (`auto`, `local`, `openai`, `gemini`, `ollama`) |
+| `AGY_EMBEDDING_API_BASE` | unset | Upstream `/embeddings` API base URL when proxying external providers |
+| `AGY_EMBEDDING_API_KEY` | unset | Upstream embedding API key (optional when caller sends `Authorization: Bearer ...`) |
+| `AGY_EMBEDDING_MODEL` | `agy-local-ngram-v1` | Default embedding model ID |
+| `AGY_EMBEDDING_DIMENSIONS` | `256` | Default vector dimensionality (`16..4096`) |
+| `AGY_EMBEDDING_BATCH_SIZE` | `32` | Max inputs per upstream `/embeddings` batch request |
+| `AGY_EMBEDDING_CACHE_FILE` | `%USERPROFILE%\.agy-zotero-bridge\embeddings-cache.json` | Persistent LRU embedding cache file |
 | `AGY_PREFIX_ARGS_JSON` | `[]` | Optional launcher prefix arguments (used by mock test harness) |
 
 ## 5. Implemented Endpoints
@@ -136,6 +152,7 @@ agy-zotero-bridge/
 | `GET /mcp-servers` | ✅ | Returns empty list + setup snippet until Zotero turn / `?probe=1`; reports `writeEnabled: true` by default |
 | `POST /run-turn` | ✅ | NDJSON `start` → `event` → `outcome`; supports one-shot `-p` default and M4 persistent `--input-format stream-json` reuse (`AGY_PROCESS_POOL=1`), `finished_reason` guards, ephemeral `--settings`, timeouts, Windows kill, redaction |
 | `POST /structured-completion` | ✅ | Stateless non-session text/JSON-schema completion via `--json-schema`, enforcing `timeoutMs` and client abort |
+| `POST /v1/embeddings`, `/embeddings`, `GET /v1/embeddings/status` | ✅ | OpenAI-compatible embedding endpoint with zero-dependency bilingual local semantic hashing, SHA-256 disk cache, and upstream batch/429 proxy |
 | `POST /invalidate-session` | ✅ | Removes scoped session mapping, kills/invalidates any pooled process, and saves atomically |
 | `POST /runtime-retention`, `/invalidate-all-hot-runtimes` | ✅ | Honors `AGY_PROCESS_POOL=1` retention & bulk invalidation (`retained: false` when pool disabled) |
 | `POST /run-action`, `/resolve-confirmation` | ⛔ `501` | Returns `501 unsupported_by_agy_headless_v0` (interactive mid-turn approval callbacks are not supported in `agy` print mode) |

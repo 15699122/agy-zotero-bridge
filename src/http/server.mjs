@@ -3,6 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { CliProbe } from '../agy/cli-probe.mjs';
 import { SessionProcessPool } from '../agy/process-pool.mjs';
 import { BridgeHttpError, runStructuredCompletion, runTurnStream } from '../agy/process-runner.mjs';
+import { EmbeddingService } from '../embedding/embedding-service.mjs';
 import { buildAgyMcpConfigSnippet, classifyToolMetadata, probeZoteroMcp, stripScopeHeader } from '../mcp/zotero-mcp.mjs';
 import { redactSensitive } from '../security/redact.mjs';
 import { SessionStore } from '../session/session-store.mjs';
@@ -64,6 +65,7 @@ export function createBridgeApp(config) {
     maxSize: config.poolMaxSize,
     idleTtlMs: config.poolIdleTtlMs
   });
+  const embeddingService = new EmbeddingService(config);
   let knownTools = [];
   let discoveredMcpTools = [];
   const capturedMcpServers = new Map();
@@ -244,6 +246,33 @@ export function createBridgeApp(config) {
         return;
       }
 
+      if (req.method === 'GET' && (path === '/v1/embeddings/status' || path === '/embeddings/status')) {
+        sendJson(res, 200, embeddingService.getStatus());
+        return;
+      }
+
+      if (req.method === 'POST' && (path === '/v1/embeddings' || path === '/embeddings')) {
+        const body = await readJsonBody(req, config.maxBody);
+        const controller = new AbortController();
+        const onClose = () => {
+          if (!res.writableFinished) controller.abort();
+        };
+        res.once('close', onClose);
+        try {
+          const payload = await embeddingService.embed({
+            input: body.input,
+            model: typeof body.model === 'string' ? body.model : '',
+            dimensions: Number(body.dimensions) || 0,
+            authHeader: req.headers.authorization || '',
+            signal: controller.signal
+          });
+          sendJson(res, 200, payload);
+        } finally {
+          res.off('close', onClose);
+        }
+        return;
+      }
+
       if (req.method === 'POST' && path === '/invalidate-session') {
         const body = await readJsonBody(req, config.maxBody);
         const k = sessionStore.sessionKey(body);
@@ -315,10 +344,12 @@ export function createBridgeApp(config) {
     sessionStore,
     cliProbe,
     processPool,
+    embeddingService,
     handler,
     async init() {
       await mkdir(config.root, { recursive: true });
       await sessionStore.load();
+      await embeddingService.load();
     },
     async close() {
       processPool.close();

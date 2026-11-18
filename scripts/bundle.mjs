@@ -15,6 +15,7 @@ const MODULE_FILES = [
   'src/agy/cli-probe.mjs',
   'src/agy/process-pool.mjs',
   'src/agy/process-runner.mjs',
+  'src/embedding/embedding-service.mjs',
   'src/session/session-store.mjs',
   'src/http/server.mjs',
   'src/claude-sdk/cli-shim.mjs'
@@ -130,9 +131,12 @@ ${moduleBodies.join('\n\n')}
 export {
   BRIDGE_VERSION,
   CliProbe,
+  EmbeddingService,
   SessionProcessPool,
   SessionStore,
   compactRuntimeContext,
+  computeLocalSemanticEmbedding,
+  cosineSimilarity,
   createBridgeApp,
   createConfig,
   ensureWindowsClaudeCmdShim,

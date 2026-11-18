@@ -365,7 +365,7 @@ export class CliProbe {
       ok: true,
       bridgeAlive: true,
       protocolVersion: 2,
-      capabilities: ['local_pdf_paths', 'model_catalog_v1', 'permission_modes_v1', 'structured_completion_v1'],
+      capabilities: ['embeddings_v1', 'local_pdf_paths', 'model_catalog_v1', 'permission_modes_v1', 'structured_completion_v1'],
       bridgeVersion: this.config.bridgeVersion,
       managedBy: this.config.managedBy || 'agy-zotero-bridge',
       agyVersion: version,
@@ -373,6 +373,13 @@ export class CliProbe {
       agyAvailable: installed,
       agyAuthenticated: null,
       authStatus: 'unverified',
+      embeddings: {
+        enabled: true,
+        provider: this.config.embeddingProvider,
+        model: this.config.embeddingModel,
+        dimensions: this.config.embeddingDimensions,
+        endpoint: '/v1/embeddings'
+      },
       diagnostics: {
         binary: this.config.binary,
         authCredentialsPresent,
