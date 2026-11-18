@@ -7,13 +7,14 @@ import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import * as bundle from '../dist/agy-zotero-bridge.mjs';
+import { BRIDGE_VERSION } from '../src/config.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BUNDLE_PATH = resolve(__dirname, '../dist/agy-zotero-bridge.mjs');
 const mockAgy = resolve(__dirname, './mock-agy.mjs');
 
 test('single-file bundle exports matches source interface', () => {
-  assert.equal(bundle.BRIDGE_VERSION, 'agy-v1.0.0');
+  assert.equal(bundle.BRIDGE_VERSION, BRIDGE_VERSION);
   assert.equal(typeof bundle.createConfig, 'function');
   assert.equal(typeof bundle.startBridgeServer, 'function');
   assert.equal(typeof bundle.runClaudeCodeAgyShim, 'function');
@@ -41,7 +42,7 @@ test('single-file bundle executes as CLI shim (--version & --help)', async () =>
     new Promise((r) => versionProc.on('close', r))
   ]);
   assert.equal(vCode, 0);
-  assert.match(vOut, /Claude Code \/ agy-zotero-bridge agy-v1\.0\.0/);
+  assert.match(vOut, new RegExp(`Claude Code / agy-zotero-bridge ${BRIDGE_VERSION.replace('.', '\\.')}`));
 
   const helpProc = spawn(process.execPath, [BUNDLE_PATH, '--help']);
   let hOut = '';
