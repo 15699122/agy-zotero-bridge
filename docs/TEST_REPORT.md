@@ -9,8 +9,9 @@
 
 | Suite / Command | Scope | Pass / Total | Notes |
 | --- | --- | --- | --- |
-| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 26 / 26 | Runs offline inside sandbox (real `agy 1.5.9` variant-to-base-model grouping, `splitModelVariant` & `resolveAgyModelAndEffort`, `parseClaudeShimArgs` & `ensureWindowsClaudeCmdShim`, managed bridge CLI flags, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, `normalizeCumulativeUsage` & `SessionProcessPool`) |
-| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/unit.test.mjs`) | 50 / 50 | Original 10 baseline integration tests + 14 new HTTP/shim integration tests (including M4 pooled PID reuse, `(model, effort)` normalization, `claude-code-agy.mjs` SDK stdio E2E, and managed `bridge.mjs` lifecycle) + 26 unit tests |
+| `npm run test:unit` | Pure unit tests (`test/unit.test.mjs`) | 28 / 28 | Runs offline inside sandbox (real `agy 1.5.9` variant-to-base-model grouping, `splitModelVariant` & `resolveAgyModelAndEffort`, `parseClaudeShimArgs` & `ensureWindowsClaudeCmdShim`, managed bridge CLI flags, event mapper + `finished_reason`, error classification, secret redaction, path traversal, `localDocuments` `%PDF-`, M5-01 multimodal image materialization & `view_file(<dir>)`, M5-02 30+ paper scope manifest & tail-safe JSON compaction, instruction path extraction, tool classification, workspace MCP/`session-settings.json`/`rules/AGENTS.md`, `stdio-http-proxy` RW default & RO opt-out, `normalizeCumulativeUsage` & `SessionProcessPool`) |
+| `npm run test:bundle` | Single-file release bundle (`test/bundle.test.mjs`) | 3 / 3 | Verifies `dist/agy-zotero-bridge.mjs` exported surface, CLI `--version` / `--help`, and SDK stdio `initialize` / `set_model` |
+| `npm test` (unsandboxed loopback) | Full suite (`test/bridge.test.mjs` + `test/bundle.test.mjs` + `test/unit.test.mjs`) | 56 / 56 | Original 10 baseline integration tests + 15 integration tests (including M4 pooled PID reuse, `(model, effort)` normalization, `claude-code-agy.mjs` SDK stdio E2E, managed `bridge.mjs` lifecycle, M5-01 multimodal SDK image materialization, and M5-02 transient 429 retry backoff) + 3 bundle tests + 28 unit tests |
 
 ### Original 10 Baseline Integration Tests (`test/bridge.test.mjs`)
 1. `health and model discovery match plugin contract` — PASS
@@ -39,6 +40,7 @@
 22. `run-turn and efforts normalize base models, legacy suffixed variants, and auto effort cleanly` — PASS
 23. `claude-code-agy.mjs speaks Claude Code CLI stream-json protocol for direct Claude Code path use` — PASS
 24. `bridge.mjs supports managed CLI flags, ADAPTER_AUTH_TOKEN, CLAUDE_BRIDGE_READY, and stdin close exit` — PASS
+25. `M5-01 & M5-02: SDK shim materializes multimodal image blocks and HTTP bridge retries transient 429` — PASS
 
 ## 2. Live E2E Observations (`agy.exe 1.5.9` + Zotero `10.0.8` + `llm-for-zotero v3.9.19`)
 

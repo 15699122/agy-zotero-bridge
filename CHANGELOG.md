@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased (v1.1.0-dev)
+
+### Added (`M5-01` & `M5-02`: Multimodal Figures & Batch Literature Optimization)
+- **Multimodal Image & Figure Inspection (`src/context/prompt-builder.mjs`, `src/claude-sdk/cli-shim.mjs`, `src/mcp/zotero-mcp.mjs`)**: Added `parseImageDataUrl`, `validateImageBuffer` (PNG/JPEG/GIF/WEBP magic bytes & 20 MB cap), `materializeTurnImages`, `renderMultimodalImagePrompt`, and `extractSdkUserImageBlocks`. Base64 screenshots and `@anthropic-ai/claude-agent-sdk` `image`/`image_url` blocks are materialized into `<cwd>/.agents/multimodal-inputs/`, image attachments & Zotero `llm-for-zotero-pdf-figure-crops` directories are automatically discovered, and ephemeral `session-settings.json` grants both `read_file(<dir>)` and `view_file(<dir>)` rules alongside workspace instructions for `paper_read` `figures`/`visual`/`capture` workflows.
+- **Batch Literature Review & Ultra-Long Context Compaction (`src/context/prompt-builder.mjs`, `src/mcp/zotero-mcp.mjs`)**: Added `extractPaperScopeManifest` (no 8-paper cap), `compactRuntimeContext` (progressive compaction guaranteeing valid JSON while preserving all paper metadata, collections, tags, and active notes), `renderBatchScopeGuidance` (3-tier `library_retrieve`/`paper_digest` -> batched `paper_read` `targets`/`outline`->`targeted` -> `review_coverage`), and `assembleTailSafePrompt` so `User request:` and attachment policies are never truncated.
+- **Transient 429 Rate-Limit Backoff & Actionable Diagnostics (`src/config.mjs`, `src/agy/process-runner.mjs`, `src/claude-sdk/cli-shim.mjs`, `src/protocol/event-mapper.mjs`)**: Added `AGY_RATE_LIMIT_MAX_RETRIES` (default `1`) and `AGY_RATE_LIMIT_RETRY_DELAY_MS` (default `1500`) for automatic backoff retries before any tool side effects occur, plus `readDirs`/`mcpSettingsFile` tracking inside M4 `poolSignature`.
+- **Research Documentation (`M6-02`, `M7-01`, `M7-02`)**: Updated `AGY_BRIDGE_DEVELOPMENT_PLAN.md` (Section 9) and `docs/UPSTREAM_CONTRACT.md` with source-verified findings for customizable Zotero/Obsidian note & tag templates, hot runtime pooling (`hotRuntimePool` vs `SessionProcessPool`), and OpenAI-compatible local Semantic Search `/v1/embeddings` bridging.
+- **Expanded Tests (`test/unit.test.mjs`, `test/bridge.test.mjs`, `test/bundle.test.mjs`)**: **56 / 56** passing tests (`28` unit + `3` bundle + `25` HTTP/shim integration).
+
 ## v1.0.0 (2026-11-18)
 
 ### Added (Single-File Release Bundle & GitHub Actions Workflow)

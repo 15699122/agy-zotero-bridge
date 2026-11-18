@@ -989,3 +989,103 @@ test('bridge.mjs supports managed CLI flags, ADAPTER_AUTH_TOKEN, CLAUDE_BRIDGE_R
     await rm(zoteroRoot, { recursive: true, force: true });
   }
 });
+
+test('M5-01 & M5-02: SDK shim materializes multimodal image blocks and HTTP bridge retries transient 429', async () => {
+  // 1. Transient 429 recovery over /run-turn (child server started with fast retry delay in separate ephemeral port)
+  const retryPort = 15200 + Math.floor(Math.random() * 1000);
+  const retryDir = await mkdtemp(join(tmpdir(), 'agy-retry-429-'));
+  const retryChild = spawn(process.execPath, [bridge], {
+    env: {
+      ...process.env,
+      AGY_BIN: binary,
+      AGY_PREFIX_ARGS_JSON: prefix,
+      AGY_CWD: retryDir,
+      AGY_BRIDGE_STATE: join(retryDir, 'sessions.json'),
+      AGY_BRIDGE_PORT: String(retryPort),
+      AGY_RATE_LIMIT_MAX_RETRIES: '1',
+      AGY_RATE_LIMIT_RETRY_DELAY_MS: '60'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  try {
+    for (let i = 0; i < 40; i++) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${retryPort}/healthz`);
+        if (r.ok) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    const r = await fetch(`http://127.0.0.1:${retryPort}/run-turn`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationKey: 'retry-conv-1',
+        userText: 'MOCK_429_ONCE'
+      })
+    });
+    const text = await r.text();
+    const frames = text.trim().split('\n').map((l) => JSON.parse(l));
+    assert.ok(
+      frames.some((f) => f.type === 'event' && f.event?.type === 'status' && /retrying turn after backoff/i.test(f.event.text))
+    );
+    const last = frames.at(-1);
+    assert.equal(last.type, 'outcome');
+    assert.equal(last.outcome.kind, 'completed');
+    assert.equal(last.outcome.text, 'Recovered after 429 retry');
+  } finally {
+    retryChild.kill();
+    await rm(retryDir, { recursive: true, force: true });
+  }
+
+  // 2. SDK shim materializes base64 image block into `.agents/multimodal-inputs/` for inspection
+  const imgShimDir = await mkdtemp(join(tmpdir(), 'agy-shim-img-'));
+  try {
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+    const proc = spawn(
+      process.execPath,
+      [claudeShim, '--output-format', 'stream-json', '--input-format', 'stream-json'],
+      {
+        cwd: imgShimDir,
+        env: { ...process.env, AGY_BIN: binary, AGY_PREFIX_ARGS_JSON: prefix },
+        stdio: ['pipe', 'pipe', 'pipe']
+      }
+    );
+
+    const outLines = [];
+    const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
+    rl.on('line', (l) => {
+      try {
+        outLines.push(JSON.parse(l));
+      } catch {}
+    });
+
+    proc.stdin.write(
+      JSON.stringify({ type: 'control_request', request_id: 'init-img', request: { subtype: 'initialize' } }) + '\n'
+    );
+    proc.stdin.write(
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'MOCK_ECHO_IMAGE_PATHS' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngBytes.toString('base64') } }
+          ]
+        }
+      }) + '\n'
+    );
+    proc.stdin.end();
+    await new Promise((r) => proc.once('close', r));
+
+    const resFrame = outLines.find((f) => f.type === 'result' && f.subtype === 'success');
+    assert.ok(resFrame, 'Expected success result frame for multimodal SDK user turn');
+    const echoed = JSON.parse(resFrame.result);
+    assert.equal(echoed.paths.length, 1);
+    assert.match(echoed.paths[0], /multimodal-inputs/);
+    assert.equal(echoed.fileSizes[0], pngBytes.length);
+  } finally {
+    await rm(imgShimDir, { recursive: true, force: true });
+  }
+});

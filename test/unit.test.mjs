@@ -5,9 +5,25 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inferModelCapabilities, parseModelsStdout, resolveAgyModelAndEffort, splitModelVariant } from '../src/agy/cli-probe.mjs';
 import { normalizeCumulativeUsage, SessionProcessPool } from '../src/agy/process-pool.mjs';
-import { ensureWindowsClaudeCmdShim, extractSdkUserText, parseClaudeShimArgs } from '../src/claude-sdk/cli-shim.mjs';
+import {
+  ensureWindowsClaudeCmdShim,
+  extractSdkUserImageBlocks,
+  extractSdkUserText,
+  parseClaudeShimArgs
+} from '../src/claude-sdk/cli-shim.mjs';
 import { createConfig, parseBridgeCliArgs } from '../src/config.mjs';
-import { buildTurnPrompt, collectLocalDocuments, sanitizeLocalPdfText, buildLocalPdfReplacements, validateLocalDocuments } from '../src/context/prompt-builder.mjs';
+import {
+  buildLocalPdfReplacements,
+  buildTurnPrompt,
+  collectLocalDocuments,
+  compactRuntimeContext,
+  extractPaperScopeManifest,
+  materializeTurnImages,
+  parseImageDataUrl,
+  sanitizeLocalPdfText,
+  validateImageBuffer,
+  validateLocalDocuments
+} from '../src/context/prompt-builder.mjs';
 import { buildScopedAgySettings, buildScopedZoteroRulesMarkdown, classifyToolMetadata, prepareScopedMcpPlugin } from '../src/mcp/zotero-mcp.mjs';
 import { forwardJsonRpcMessage } from '../src/mcp/stdio-http-proxy.mjs';
 import { classifyAgyError, createTurnEventMapper } from '../src/protocol/event-mapper.mjs';
@@ -817,5 +833,128 @@ test('parseClaudeShimArgs, extractSdkUserText, ensureWindowsClaudeCmdShim, and m
     assert.ok(cfg.root.endsWith('agent-runtime'));
   } finally {
     await rm(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test('M5-01 multimodal image parsing, magic-byte validation, materialization, and view_file permissions', async () => {
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+  const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+  const pngDataUrl = `data:image/png;base64,${pngBytes.toString('base64')}`;
+  const bogusDataUrl = `data:image/png;base64,${Buffer.from('not-a-png').toString('base64')}`;
+
+  const parsedPng = parseImageDataUrl(pngDataUrl);
+  assert.ok(parsedPng);
+  assert.equal(parsedPng.mediaType, 'image/png');
+  assert.equal(parsedPng.ext, 'png');
+  assert.equal(validateImageBuffer(parsedPng.buffer, 'image/png').valid, true);
+  assert.equal(validateImageBuffer(Buffer.from('not-a-png'), 'image/png').valid, false);
+  assert.equal(validateImageBuffer(jpegBytes, 'image/jpeg').valid, true);
+
+  const sdkBlocks = extractSdkUserImageBlocks({
+    message: {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Analyze Fig 2' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngBytes.toString('base64') } },
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${jpegBytes.toString('base64')}` } }
+      ]
+    }
+  });
+  assert.equal(sdkBlocks.length, 2);
+  assert.equal(sdkBlocks[0].mediaType, 'image/png');
+  assert.equal(sdkBlocks[1].mediaType, 'image/jpeg');
+
+  const tmpDir = await mkdtemp(join(tmpdir(), 'agy-m5-img-test-'));
+  try {
+    const attJpg = join(tmpDir, 'crop-fig2.jpg');
+    await writeFile(attJpg, jpegBytes);
+
+    const cfg = createConfig({ AGY_CWD: tmpDir });
+    const built = await buildTurnPrompt(
+      {
+        userText: 'Explain panel A vs B in Figure 2.',
+        runtimeRequest: {
+          screenshots: [pngDataUrl, bogusDataUrl],
+          attachments: [{ category: 'image', storedPath: attJpg, name: 'crop-fig2.jpg' }]
+        }
+      },
+      { resumed: false, config: cfg, cwd: tmpDir }
+    );
+
+    assert.equal(built.imageAssets.length, 2);
+    assert.equal(built.rejectedImages.length, 1);
+    assert.match(built.prompt, /Multimodal image inputs attached for this turn:/);
+    assert.match(built.prompt, /read_file.*view_file/i);
+    assert.ok(built.extraAddDirs.some((d) => d.includes('multimodal-inputs')));
+
+    const materializedBytes = await readFile(built.imageAssets[0].path);
+    assert.deepEqual(materializedBytes, pngBytes);
+
+    const settings = buildScopedAgySettings({
+      serverNames: ['llm_for_zotero_p1'],
+      readDirs: built.extraAddDirs
+    });
+    assert.ok(settings.permissions.allow.some((rule) => rule.startsWith('view_file(')));
+    assert.ok(settings.permissions.allow.some((rule) => rule.startsWith('read_file(')));
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('M5-02 batch literature scope manifest and tail-safe JSON context compaction across 30+ papers', async () => {
+  const papers = [];
+  for (let i = 1; i <= 32; i += 1) {
+    papers.push({
+      libraryID: 1,
+      itemId: 1000 + i,
+      contextItemId: 2000 + i,
+      itemKey: `KEY${i}`,
+      title: `Novel Biomaterial Study Part ${i}`,
+      year: 2020 + (i % 6),
+      authors: [`Author${i}`],
+      doi: `10.1000/study.${i}`,
+      abstractNote: 'A'.repeat(2000),
+      fullText: 'B'.repeat(8000)
+    });
+  }
+
+  const runtimeRequest = {
+    selectedCollectionContexts: [{ libraryID: 1, collectionId: 55, name: 'TiO2 Nanotubes' }],
+    selectedPaperContexts: papers,
+    history: Array.from({ length: 20 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: 'H'.repeat(2500)
+    }))
+  };
+
+  const manifest = extractPaperScopeManifest(runtimeRequest);
+  assert.equal(manifest.length, 32);
+  assert.equal(manifest[0].itemKey, 'KEY1');
+  assert.equal(manifest[31].itemKey, 'KEY32');
+
+  const compacted = compactRuntimeContext(runtimeRequest, 30_000);
+  assert.equal(compacted.compacted, true);
+  assert.ok(compacted.serialized.length <= 30_000);
+  const reparsed = JSON.parse(compacted.serialized);
+  assert.equal(reparsed.paperScopeManifest.length, 32);
+  assert.equal(reparsed.selectedCollectionContexts[0].name, 'TiO2 Nanotubes');
+
+  const tmpDir = await mkdtemp(join(tmpdir(), 'agy-m5-batch-'));
+  try {
+    const cfg = createConfig({ AGY_CWD: tmpDir });
+    cfg.maxPrompt = 8000;
+    const built = await buildTurnPrompt(
+      {
+        userText: 'FINAL_USER_QUESTION_MUST_SURVIVE',
+        metadata: { customInstruction: 'SYS '.repeat(1500) },
+        runtimeRequest
+      },
+      { resumed: false, config: cfg, cwd: tmpDir }
+    );
+    assert.ok(built.prompt.length <= 8000);
+    assert.ok(built.prompt.endsWith('User request:\nFINAL_USER_QUESTION_MUST_SURVIVE'));
+    assert.equal(built.paperManifest.length, 32);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
   }
 });

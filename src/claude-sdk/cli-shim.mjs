@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { CliProbe, resolveAgyModelAndEffort } from '../agy/cli-probe.mjs';
 import { killProcessTree, permissionArgs } from '../agy/process-runner.mjs';
 import { BRIDGE_VERSION, createConfig } from '../config.mjs';
-import { discoverSafeReadDirs } from '../context/prompt-builder.mjs';
+import { discoverSafeReadDirs, materializeTurnImages, renderMultimodalImagePrompt } from '../context/prompt-builder.mjs';
 import { prepareScopedMcpPlugin, probeZoteroMcp, writeScopedAgySettingsFile } from '../mcp/zotero-mcp.mjs';
 import { classifyAgyError, createTurnEventMapper } from '../protocol/event-mapper.mjs';
 import { redactSensitive } from '../security/redact.mjs';
@@ -233,6 +233,35 @@ export function extractSdkUserText(msg) {
 }
 
 /**
+ * Extracts base64 image blocks from an SDK `user` JSONL line (`type: "image"` or data-URI `image_url`).
+ */
+export function extractSdkUserImageBlocks(msg) {
+  const content = msg?.message?.content ?? msg?.content;
+  if (!Array.isArray(content)) return [];
+  const blocks = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    if (part.type === 'image' && part.source && typeof part.source === 'object') {
+      if (part.source.type === 'base64' && typeof part.source.data === 'string' && typeof part.source.media_type === 'string') {
+        blocks.push({ mediaType: part.source.media_type, data: part.source.data });
+      } else if (part.source.type === 'url' && typeof part.source.url === 'string') {
+        const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(part.source.url.trim());
+        if (m) blocks.push({ mediaType: m[1].toLowerCase(), data: m[2].replace(/\s+/g, '') });
+      }
+      continue;
+    }
+    if (part.type === 'image_url') {
+      const rawUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+      if (typeof rawUrl === 'string') {
+        const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(rawUrl.trim());
+        if (m) blocks.push({ mediaType: m[1].toLowerCase(), data: m[2].replace(/\s+/g, '') });
+      }
+    }
+  }
+  return blocks;
+}
+
+/**
  * Ensures `node_modules/@anthropic-ai/claude-code/cli.js` exists inside `repoRoot`
  * so `llm-for-zotero`'s `resolveWindowsClaudeShim()` works when `claude-code-agy.cmd`
  * is configured in Windows **Claude Code path**.
@@ -312,7 +341,7 @@ export async function runClaudeCodeAgyShim({
     stdout.write(JSON.stringify(obj) + '\n');
   };
 
-  async function executeTurn(userText) {
+  async function executeTurn(userText, imageBlocks = []) {
     const startedAt = Date.now();
     interruptRequested = false;
     const fallbackSessionId = activeResumeId || parsed.sessionId || randomUUID();
@@ -339,13 +368,48 @@ export async function runClaudeCodeAgyShim({
       const allowWriteForTurn = effectivePermissionMode === 'plan' ? false : config.zoteroMcpAllowWrite;
       const noToolsMode = parsed.hasToolsFlag && parsed.tools === '';
 
-      const promptSections = [];
+      const { imageAssets, rejectedImages, imageReadDirs } = await materializeTurnImages({
+        sdkImageBlocks: imageBlocks,
+        cwd: workCwd,
+        allowedRoots: [...config.allowedPdfRoots, ...config.extraDirs]
+      });
+
+      const headSections = [];
       if (!systemPromptDelivered && !activeResumeId) {
-        if (systemPromptText.trim()) promptSections.push(systemPromptText.trim());
-        if (appendSystemPromptText.trim()) promptSections.push(appendSystemPromptText.trim());
+        if (systemPromptText.trim()) headSections.push(systemPromptText.trim());
+        if (appendSystemPromptText.trim()) headSections.push(appendSystemPromptText.trim());
       }
-      promptSections.push(userText);
-      const fullPrompt = promptSections.join('\n\n---\n\n').slice(0, config.maxPrompt);
+      if (rejectedImages.length > 0 && imageAssets.length === 0) {
+        headSections.push(
+          `Attachment notice: ${rejectedImages.length} image block(s) could not be materialized (${rejectedImages
+            .map((r) => r.reason)
+            .join(', ')}).`
+        );
+      }
+
+      const tailSections = [];
+      if (imageAssets.length > 0) {
+        tailSections.push(renderMultimodalImagePrompt(imageAssets));
+      }
+      if (userText.trim() || tailSections.length === 0) {
+        tailSections.push(userText || 'Please inspect the attached image(s).');
+      }
+
+      const sep = '\n\n---\n\n';
+      const tailText = tailSections.join(sep);
+      let fullPrompt = tailText;
+      if (tailText.length >= config.maxPrompt) {
+        fullPrompt = tailText.slice(tailText.length - config.maxPrompt);
+      } else if (headSections.length > 0) {
+        const headText = headSections.join(sep);
+        const remaining = config.maxPrompt - tailText.length - sep.length;
+        if (remaining > 0) {
+          fullPrompt =
+            headText.length <= remaining
+              ? `${headText}${sep}${tailText}`
+              : `${headText.slice(0, remaining)}${sep}${tailText}`;
+        }
+      }
 
       let readDirs = [];
       let settingsFile = '';
@@ -354,7 +418,8 @@ export async function runClaudeCodeAgyShim({
           root: workCwd,
           extraDirs: [...config.extraDirs, ...parsed.addDirs],
           allowedPdfRoots: config.allowedPdfRoots,
-          instructionTexts: [systemPromptText, appendSystemPromptText, userText]
+          instructionTexts: [systemPromptText, appendSystemPromptText, userText],
+          imageReadDirs
         });
 
         if (Object.keys(activeMcpServers).length > 0) {
@@ -393,184 +458,211 @@ export async function runClaudeCodeAgyShim({
         args.push('--add-dir', dir);
       }
 
-      let turnStderr = '';
-      let childError = null;
-      let lastUsage = null;
+      let finalState = null;
+      let finalLastUsage = null;
+      let finalFailure = null;
+      let finalClassified = null;
 
-      const child = spawn(config.binary, [...config.prefixArgs, ...args], {
-        cwd: workCwd,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
-      });
-      activeChild = child;
+      for (let attempt = 0; attempt <= config.rateLimitMaxRetries; attempt += 1) {
+        let turnStderr = '';
+        let childError = null;
+        let lastUsage = null;
 
-      child.on('error', (err) => {
-        childError = err;
-      });
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (chunk) => {
-        turnStderr = (turnStderr + chunk).slice(-config.maxStderr);
-      });
+        const child = spawn(config.binary, [...config.prefixArgs, ...args], {
+          cwd: workCwd,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true
+        });
+        activeChild = child;
 
-      const mapper = createTurnEventMapper({
-        runId: `agy-shim-${randomUUID()}`,
-        model,
-        onTools: (tools) => {
-          toolsFromInit = tools;
-        },
-        onEvent: (ev) => {
-          const sessionId = mapper.getState().sessionId || ev.sessionId || fallbackSessionId;
-          if (ev.type === 'provider_event' && ev.providerType === 'agy_session') {
-            emitInitIfNeeded(sessionId);
-            return;
-          }
-          if (ev.type === 'message_delta') {
-            emitInitIfNeeded(sessionId);
-            writeJsonLine({
-              type: 'stream_event',
-              session_id: sessionId,
-              event: {
-                type: 'content_block_delta',
-                index: 0,
-                delta: { type: 'text_delta', text: ev.text }
-              }
-            });
-            return;
-          }
-          if (ev.type === 'tool_call') {
-            emitInitIfNeeded(sessionId);
-            writeJsonLine({
-              type: 'assistant',
-              session_id: sessionId,
-              parent_tool_use_id: null,
-              message: {
-                role: 'assistant',
-                content: [
-                  {
-                    type: 'tool_use',
-                    id: ev.callId,
-                    name: ev.name,
-                    input: ev.args ?? {}
-                  }
-                ]
-              }
-            });
-            return;
-          }
-          if (ev.type === 'tool_result') {
-            emitInitIfNeeded(sessionId);
-            writeJsonLine({
-              type: 'user',
-              session_id: sessionId,
-              parent_tool_use_id: null,
-              message: {
-                role: 'user',
-                content: [
-                  {
-                    type: 'tool_result',
-                    tool_use_id: ev.callId,
-                    content: ev.content ?? '',
-                    is_error: ev.ok === false
-                  }
-                ]
-              }
-            });
-            return;
-          }
-          if (ev.type === 'tool_error') {
-            emitInitIfNeeded(sessionId);
-            writeJsonLine({
-              type: 'user',
-              session_id: sessionId,
-              parent_tool_use_id: null,
-              message: {
-                role: 'user',
-                content: [
-                  {
-                    type: 'tool_result',
-                    tool_use_id: ev.callId,
-                    content: ev.error || 'tool_error',
-                    is_error: true
-                  }
-                ]
-              }
-            });
-            return;
-          }
-          if (ev.type === 'usage') {
-            lastUsage = {
-              input_tokens: ev.inputTokens,
-              output_tokens: ev.outputTokens,
-              cache_creation_input_tokens: ev.cacheCreationInputTokens || 0,
-              cache_read_input_tokens: ev.cacheReadInputTokens || 0
-            };
-            lastContextTokens =
-              ev.contextTokens ||
-              ev.inputTokens + ev.outputTokens + (ev.cacheReadInputTokens || 0);
-            writeJsonLine({
-              type: 'stream_event',
-              session_id: sessionId,
-              event: {
-                type: 'message_delta',
-                usage: lastUsage
-              }
-            });
-          }
-        },
-        maxNdjsonLine: config.maxNdjsonLine,
-        extraSecrets: [config.token]
-      });
+        child.on('error', (err) => {
+          childError = err;
+        });
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (chunk) => {
+          turnStderr = (turnStderr + chunk).slice(-config.maxStderr);
+        });
 
-      let mapperError = null;
-      const rlOut = createInterface({ input: child.stdout, crlfDelay: Infinity });
-      try {
-        for await (const line of rlOut) {
-          try {
-            mapper.processLine(line);
-          } catch (err) {
-            mapperError = err;
-            killProcessTree(child);
-            break;
+        const mapper = createTurnEventMapper({
+          runId: `agy-shim-${randomUUID()}`,
+          model,
+          onTools: (tools) => {
+            toolsFromInit = tools;
+          },
+          onEvent: (ev) => {
+            const sessionId = mapper.getState().sessionId || ev.sessionId || fallbackSessionId;
+            if (ev.type === 'provider_event' && ev.providerType === 'agy_session') {
+              emitInitIfNeeded(sessionId);
+              return;
+            }
+            if (ev.type === 'message_delta') {
+              emitInitIfNeeded(sessionId);
+              writeJsonLine({
+                type: 'stream_event',
+                session_id: sessionId,
+                event: {
+                  type: 'content_block_delta',
+                  index: 0,
+                  delta: { type: 'text_delta', text: ev.text }
+                }
+              });
+              return;
+            }
+            if (ev.type === 'tool_call') {
+              emitInitIfNeeded(sessionId);
+              writeJsonLine({
+                type: 'assistant',
+                session_id: sessionId,
+                parent_tool_use_id: null,
+                message: {
+                  role: 'assistant',
+                  content: [
+                    {
+                      type: 'tool_use',
+                      id: ev.callId,
+                      name: ev.name,
+                      input: ev.args ?? {}
+                    }
+                  ]
+                }
+              });
+              return;
+            }
+            if (ev.type === 'tool_result') {
+              emitInitIfNeeded(sessionId);
+              writeJsonLine({
+                type: 'user',
+                session_id: sessionId,
+                parent_tool_use_id: null,
+                message: {
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'tool_result',
+                      tool_use_id: ev.callId,
+                      content: ev.content ?? '',
+                      is_error: ev.ok === false
+                    }
+                  ]
+                }
+              });
+              return;
+            }
+            if (ev.type === 'tool_error') {
+              emitInitIfNeeded(sessionId);
+              writeJsonLine({
+                type: 'user',
+                session_id: sessionId,
+                parent_tool_use_id: null,
+                message: {
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'tool_result',
+                      tool_use_id: ev.callId,
+                      content: ev.error || 'tool_error',
+                      is_error: true
+                    }
+                  ]
+                }
+              });
+              return;
+            }
+            if (ev.type === 'usage') {
+              lastUsage = {
+                input_tokens: ev.inputTokens,
+                output_tokens: ev.outputTokens,
+                cache_creation_input_tokens: ev.cacheCreationInputTokens || 0,
+                cache_read_input_tokens: ev.cacheReadInputTokens || 0
+              };
+              lastContextTokens =
+                ev.contextTokens ||
+                ev.inputTokens + ev.outputTokens + (ev.cacheReadInputTokens || 0);
+              writeJsonLine({
+                type: 'stream_event',
+                session_id: sessionId,
+                event: {
+                  type: 'message_delta',
+                  usage: lastUsage
+                }
+              });
+            }
+          },
+          maxNdjsonLine: config.maxNdjsonLine,
+          extraSecrets: [config.token]
+        });
+
+        let mapperError = null;
+        const rlOut = createInterface({ input: child.stdout, crlfDelay: Infinity });
+        try {
+          for await (const line of rlOut) {
+            try {
+              mapper.processLine(line);
+            } catch (err) {
+              mapperError = err;
+              killProcessTree(child);
+              break;
+            }
           }
+        } finally {
+          rlOut.close();
         }
-      } finally {
-        rlOut.close();
+
+        const exitInfo = await new Promise((resolveExit) => {
+          if (childError || child.exitCode !== null || child.signalCode !== null) {
+            resolveExit({ code: child.exitCode ?? 1, signal: child.signalCode });
+            return;
+          }
+          const finish = (code, signal) => resolveExit({ code, signal });
+          child.once('close', finish);
+          child.once('error', () => finish(child.exitCode ?? 1, child.signalCode));
+        });
+        activeChild = null;
+
+        if (turnStderr.trim()) {
+          stderr.write(redactSensitive(turnStderr, [config.token]));
+        }
+
+        const state = mapper.getState();
+        const failure =
+          childError ||
+          mapperError ||
+          (interruptRequested ? new Error('interrupted') : null) ||
+          (!state.resultSeen ? new Error('agy exited without a terminal result') : null) ||
+          (exitInfo.code !== 0 ? new Error(`agy process exited with code ${exitInfo.code}`) : null) ||
+          (!state.success ? new Error('agy did not complete successfully') : null);
+
+        finalState = state;
+        finalLastUsage = lastUsage;
+        finalFailure = failure;
+
+        if (!failure) {
+          finalClassified = null;
+          break;
+        }
+
+        finalClassified = classifyAgyError(failure.message, turnStderr, exitInfo.code ?? 1, [config.token]);
+        if (
+          finalClassified.code === 'rate_limited' &&
+          !interruptRequested &&
+          state.settledToolCount === 0 &&
+          attempt < config.rateLimitMaxRetries
+        ) {
+          await new Promise((r) => setTimeout(r, config.rateLimitRetryDelayMs * (attempt + 1)));
+          continue;
+        }
+        break;
       }
 
-      const exitInfo = await new Promise((resolveExit) => {
-        if (childError || child.exitCode !== null || child.signalCode !== null) {
-          resolveExit({ code: child.exitCode ?? 1, signal: child.signalCode });
-          return;
-        }
-        const finish = (code, signal) => resolveExit({ code, signal });
-        child.once('close', finish);
-        child.once('error', () => finish(child.exitCode ?? 1, child.signalCode));
-      });
-      activeChild = null;
-
-      if (turnStderr.trim()) {
-        stderr.write(redactSensitive(turnStderr, [config.token]));
-      }
-
-      const state = mapper.getState();
-      const sessionId = state.sessionId || fallbackSessionId;
+      const sessionId = finalState?.sessionId || fallbackSessionId;
       emitInitIfNeeded(sessionId);
 
-      const failure =
-        childError ||
-        mapperError ||
-        (interruptRequested ? new Error('interrupted') : null) ||
-        (!state.resultSeen ? new Error('agy exited without a terminal result') : null) ||
-        (exitInfo.code !== 0 ? new Error(`agy process exited with code ${exitInfo.code}`) : null) ||
-        (!state.success ? new Error('agy did not complete successfully') : null);
-
-      if (failure) {
-        const classified = classifyAgyError(failure.message, turnStderr, exitInfo.code ?? 1, [config.token]);
+      if (finalFailure) {
         writeJsonLine({
           type: 'result',
           subtype: 'error_during_execution',
           is_error: true,
-          errors: [{ message: classified.reason }],
+          errors: [{ message: finalClassified?.reason || 'agy error' }],
           duration_ms: Date.now() - startedAt,
           num_turns: 1,
           session_id: sessionId
@@ -579,12 +671,12 @@ export async function runClaudeCodeAgyShim({
       }
 
       systemPromptDelivered = true;
-      if (!parsed.noSessionPersistence && state.sessionId) {
-        activeResumeId = state.sessionId;
+      if (!parsed.noSessionPersistence && finalState.sessionId) {
+        activeResumeId = finalState.sessionId;
       }
 
       const activeModelKey = model || 'agy';
-      const usageOut = lastUsage || {
+      const usageOut = finalLastUsage || {
         input_tokens: 0,
         output_tokens: 0,
         cache_creation_input_tokens: 0,
@@ -595,7 +687,7 @@ export async function runClaudeCodeAgyShim({
         type: 'result',
         subtype: 'success',
         is_error: false,
-        result: state.output,
+        result: finalState.output,
         duration_ms: Date.now() - startedAt,
         num_turns: 1,
         session_id: sessionId,
@@ -736,11 +828,12 @@ export async function runClaudeCodeAgyShim({
 
     if (frame?.type === 'user') {
       const userText = extractSdkUserText(frame);
-      if (!userText.trim()) {
+      const imageBlocks = extractSdkUserImageBlocks(frame);
+      if (!userText.trim() && imageBlocks.length === 0) {
         // SDK metadata probes (supportedModels / supportedCommands / mcpServerStatus) pass prompt: ""
         return;
       }
-      turnChain = turnChain.then(() => executeTurn(userText)).catch((err) => {
+      turnChain = turnChain.then(() => executeTurn(userText, imageBlocks)).catch((err) => {
         stderr.write(redactSensitive(err?.message || err, [config.token]) + '\n');
       });
     }

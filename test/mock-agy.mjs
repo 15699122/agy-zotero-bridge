@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
 const args = process.argv.slice(2);
@@ -82,9 +84,31 @@ function handlePrompt(prompt, turnNumber = 1, cumUsage = { inTok: 0, outTok: 0, 
     return;
   }
 
+  if (prompt.includes('MOCK_429_ONCE')) {
+    const markerFile = join(process.cwd(), '.mock-429-once');
+    if (!existsSync(markerFile)) {
+      writeFileSync(markerFile, '1', 'utf8');
+      emit({ event: 'result', result: { conversation_id: cid, status: 'ERROR', error: 'HTTP 429 rate limit exceeded', response: '' } });
+      if (!isStdinStreamJson) process.exit(0);
+      return;
+    }
+    emit({ event: 'step_update', step_update: { step_index: 3, step_type: 'agent_response', state: 'DONE', text: 'Recovered after 429 retry' } });
+    emit({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: 'Recovered after 429 retry', usage: { input_tokens: 5, output_tokens: 5, total_tokens: 10 } } });
+    return;
+  }
+
   if (prompt.includes('MOCK_429')) {
     emit({ event: 'result', result: { conversation_id: cid, status: 'ERROR', error: 'HTTP 429 rate limit exceeded', response: '' } });
     if (!isStdinStreamJson) process.exit(0);
+    return;
+  }
+
+  if (prompt.includes('MOCK_ECHO_IMAGE_PATHS')) {
+    const paths = [...prompt.matchAll(/path=([^\s|]+)/g)].map((m) => m[1]);
+    const fileSizes = paths.map((p) => (existsSync(p) ? readFileSync(p).length : -1));
+    const payload = JSON.stringify({ paths, fileSizes });
+    emit({ event: 'step_update', step_update: { step_index: 3, step_type: 'agent_response', state: 'DONE', text: payload } });
+    emit({ event: 'result', result: { conversation_id: cid, status: 'SUCCESS', response: payload, usage: { input_tokens: 6, output_tokens: 6, total_tokens: 12 } } });
     return;
   }
 

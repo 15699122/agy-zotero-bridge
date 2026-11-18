@@ -195,6 +195,8 @@ export function createConfig(env = process.env, argv = []) {
     maxNdjsonLine: 2_000_000,
     maxStderr: 20_000,
     defaultTurnTimeoutMs: Number(env.AGY_TURN_TIMEOUT_MS || 30 * 60 * 1000),
-    defaultStructuredTimeoutMs: Number(env.AGY_STRUCTURED_TIMEOUT_MS || 120_000)
+    defaultStructuredTimeoutMs: Number(env.AGY_STRUCTURED_TIMEOUT_MS || 120_000),
+    rateLimitMaxRetries: Math.max(0, Math.min(3, Number(env.AGY_RATE_LIMIT_MAX_RETRIES ?? 1))),
+    rateLimitRetryDelayMs: Math.max(50, Math.min(30_000, Number(env.AGY_RATE_LIMIT_RETRY_DELAY_MS ?? 1500)))
   };
 }

@@ -208,24 +208,128 @@ agy 官方文档需核对所安装版本：
 
 ## 5. 实现次序（面向执行的任务清单）
 
-- [ ] `M0-01` 读取全部基线文件与官方/上游协议；建立来源追踪表。
-- [ ] `M0-02` 运行基线 10 测试；记录原版本与当前环境。
-- [ ] `M1-01` 抽取可单测的 agy NDJSON parser / event mapper；保留旧接口。
-- [ ] `M1-02` 添加真实格式 fixtures 的脱敏方案，覆盖异常、工具与增量。
-- [ ] `M1-03` 处理超时、stderr、退出、Abort、Windows 子进程树与写入背压。
-- [ ] `M1-04` 完成 `/structured-completion` 或提交明确的不支持证据。
-- [ ] `M1-05` 模型/effort/healthz 真实能力探测与安全回退。
-- [ ] `M1-06` 输出 `docs/TEST_REPORT.md`、回归测试与 v0.2 CHANGELOG。
-- [ ] `M2-01` 验证 Zotero MCP endpoint、工具与鉴权实际合同。
-- [ ] `M2-02` agy MCP 注册、只读检索与元数据可追踪。
-- [ ] `M2-03` Notes/标签受控写入、预览与回读测试。
-- [ ] `M2-04` MCP 错误恢复、失效凭据、权限与端点兼容性。
-- [ ] `M3-01` 完整插件上下文、PDF/图像真实能力验证与实现。
-- [ ] `M3-02` 用户 Skills/项目指令加载与信任边界。
-- [ ] `M3-03` 六类文献工作流回归与引用/写入准确性检查。
-- [ ] `M4-01` stdin stream-json 常驻进程模型、回合隔离、累计 usage 归一化。
-- [ ] `M4-02` 进程池、空闲清理、错误恢复、取消与回滚。
-- [ ] `M4-03` Windows/Zotero 长时稳定性、性能与发布文档。
+- [x] `M0-01` 读取全部基线文件与官方/上游协议；建立来源追踪表。
+- [x] `M0-02` 运行基线 10 测试；记录原版本与当前环境。
+- [x] `M1-01` 抽取可单测的 agy NDJSON parser / event mapper；保留旧接口。
+- [x] `M1-02` 添加真实格式 fixtures 的脱敏方案，覆盖异常、工具与增量。
+- [x] `M1-03` 处理超时、stderr、退出、Abort、Windows 子进程树与写入背压。
+- [x] `M1-04` 完成 `/structured-completion` 或提交明确的不支持证据。
+- [x] `M1-05` 模型/effort/healthz 真实能力探测与安全回退。
+- [x] `M1-06` 输出 `docs/TEST_REPORT.md`、回归测试与 v0.2 CHANGELOG。
+- [x] `M2-01` 验证 Zotero MCP endpoint、工具与鉴权实际合同。
+- [x] `M2-02` agy MCP 注册、只读检索与元数据可追踪。
+- [x] `M2-03` Notes/标签受控写入、预览与回读测试。
+- [x] `M2-04` MCP 错误恢复、失效凭据、权限与端点兼容性。
+- [x] `M3-01` 完整插件上下文、PDF/图像真实能力验证与实现。
+- [x] `M3-02` 用户 Skills/项目指令加载与信任边界。
+- [x] `M3-03` 六类文献工作流回归与引用/写入准确性检查。
+- [x] `M4-01` stdin stream-json 常驻进程模型、回合隔离、累计 usage 归一化。
+- [x] `M4-02` 进程池、空闲清理、错误恢复、取消与回滚。
+- [x] `M4-03` Windows/Zotero 长时稳定性、性能与发布文档。
+- [x] `M4-04` 单文件可执行包装（`dist/agy-zotero-bridge.mjs`）、基础模型/Thinking Level 正交分离与 GitHub Actions 自动 Release（v1.0.0 已正式发布）。
+
+---
+
+## 8. v1.1+ 后续演进规划（Post-v1.0 Roadmap）
+
+> **当前基线**：`v1.0.0` 已实现单文件独立发布、直接 `Claude Code path` 托管启动、`writeEnabled: true` 默认读写与真实 Zotero 端到端验证。以下规划面向高阶学术研读、自动化配置便利性与长会话性能优化。
+
+### 方向 A：高阶文献研读与多模态能力增强（`M5` ✅ 已完成并验证）
+1. **`M5-01` 多模态图表/实验架构图深度解析（✅ 已完成）**：
+   - **目标**：突破纯文本 / MinerU 文本层的局限，充分利用 Gemini 3.8 / 4 原生 Vision 能力对扫描件及论文插图（折线图、电镜图、流程图等）进行精准数据提取与分析。
+   - **已实现内容**：
+     - 在 `src/context/prompt-builder.mjs` 中新增 `parseImageDataUrl`、`validateImageBuffer`（PNG/JPEG/GIF/WEBP 魔数头与 20 MB 大小校验）、`materializeTurnImages` 及 `renderMultimodalImagePrompt`，支持将 `runtimeRequest.screenshots`（Base64 Data URL）、SDK `user` 帧中的 base64 `image`/`image_url` 内容块落盘至工作区 `.agents/multimodal-inputs/`，并自动放行图像附件路径与 Zotero figure crop 缓存目录。
+     - 在 `src/mcp/zotero-mcp.mjs` 的 `buildScopedAgySettings` 中同时下发 `read_file(<dir>)` 与 `view_file(<dir>)` 会话级只读授权；在 `buildScopedZoteroRulesMarkdown` 中明确指引 `agy` 配合 `paper_read({ mode: "figures" | "visual" | "capture" })` 提取图表裁剪图后直接调用 `read_file`/`view_file` 查看像素内容，同时保留 `no_figures`/失败场景的纯文本降级诚信约束。
+     - 在 `src/claude-sdk/cli-shim.mjs` 中新增 `extractSdkUserImageBlocks` 并将其接入 `executeTurn` 与单文件打包产物 `dist/agy-zotero-bridge.mjs`。
+2. **`M5-02` 大规模文献综述与超长上下文优化（✅ 已完成）**：
+   - **目标**：支持用户一次性勾选 20～50 篇文献进行领域综述或批量筛选时，防止上下文溢出或触发 429 速率限制。
+   - **已实现内容**：
+     - 在 `src/context/prompt-builder.mjs` 中新增 `extractPaperScopeManifest`、`compactRuntimeContext`、`renderBatchScopeGuidance` 与尾部保护组装函数 `assembleTailSafePrompt`：面对 8–50+ 篇多文献或 >200KB `runtimeRequest` 时不再生硬截断 JSON 字符串，而是渐进折叠重型全文字段并生成包含全部 `libraryID`/`itemId`/`contextItemId`/`itemKey` 的合法 JSON 清单与 3 阶段分层检索提示，确保 `User request:` 始终完整保留。
+     - 在 `src/mcp/zotero-mcp.mjs` 工作区规则中新增批处理综述（`library_retrieve` -> 3–6 篇分批 `paper_read` `targets`/`outline`->`targeted` -> `review_coverage` 覆盖边界报告）约束。
+     - 在 `src/config.mjs`、`src/protocol/event-mapper.mjs`、`src/agy/process-runner.mjs` 与 `src/claude-sdk/cli-shim.mjs` 中新增 `AGY_RATE_LIMIT_MAX_RETRIES` / `AGY_RATE_LIMIT_RETRY_DELAY_MS`：在无工具副作用产生前遭遇瞬时 HTTP 429 时自动指数退避重试，并在最终 429 失败时附加减批/降推理强度提示。
+
+### 方向 B：交互体验与自动化配置便利性（`M6`）
+1. **`M6-01` Windows 一键部署与自动关联脚本（`scripts/setup-zotero.ps1`）**：
+   - **目标**：消除新手手动复制路径时可能误带中文弯引号（`“...”`）、路径转义或忘记取消勾选 *Use my own bridge* 的配置门槛。
+   - **大致开发内容**：
+     - 编写自动检测工具：检查 `node --version` (>=20)、`agy --version` 登录状态、自动下载或定位最新单文件版 `agy-zotero-bridge.mjs`。
+     - 安全检查 Zotero 进程是否关闭，定位 `%APPDATA%\Zotero\Zotero\Profiles\*.default\prefs.js` 并备份，自动写入标准无引号的 `claudeCodeCliPath` 与 `claudeCodeBridgeMode: "managed"` 配置。
+2. **`M6-02` 可定制的 Zotero / Obsidian 笔记与标签模板**：
+   - **目标**：使 Agent 生成的文献笔记和标签体系高度契合用户个人的科研知识库规范。
+   - **大致开发内容**：
+     - 支持通过环境变量或本地配置文件（如 `~/.agy-zotero-bridge/templates.json`）注入自定义笔记结构（元数据表、创新点、实验对照、局限性、思考题）。
+     - 在 `src/context/prompt-builder.mjs` 首轮系统指令注入阶段自动加载用户模板，并要求在写回后执行结构化校验。
+
+### 方向 C：性能深化与语义检索扩展（`M7`）
+1. **`M7-01` 常驻进程池默认化与首字时延调优**：
+   - **目标**：在多轮连续追问场景下降低 `agy.exe` 冷启动开销，缩短首字响应时间（TTFT）。
+   - **大致开发内容**：
+     - 对 `SessionProcessPool`（`src/agy/process-pool.mjs`）在 Windows 托管模式下的内存占用、空闲自动回收（TTL）及异常崩塌隔离进行长时压测。
+     - 评估并制定安全的默认开启条件（如仅对同一会话连续对话保持温启动，切换文献库或模型时自动重建）。
+2. **`M7-02` 本地语义向量检索桥接探索**：
+   - **目标**：增强海量本地文献库中的模糊语义检索能力，辅助 Zotero 现有关键词搜索。
+   - **大致开发内容**：
+     - 调研 `llm-for-zotero` 设置中 `embeddingProvider` 与外部嵌入服务的交互接口。
+     - 评估通过桥接器提供标准 OpenAI 兼容 `/v1/embeddings` 代理端点的可行性，实现与 Gemini Embedding 模型的无缝对接。
+
+---
+
+## 9. 专项技术研究报告（`M6-02`、`M7-01`、`M7-02`）
+
+> 以下结论均基于对本地已安装 `llm-for-zotero v3.9.19`（`content/scripts/llmforzotero.js`、`content/claude-bridge/bridge.mjs`）、Zotero `prefs.js` 与 `agy.exe 1.5.9` 源码/契约的直接源码级核查。
+
+### 9.1 `M6-02` 可定制的 Zotero / Obsidian 笔记与标签模板研究
+
+1. **上游技能契约（`write-note.md` v19 & `reorganize-library.md` v3）**：
+   - `llm-for-zotero` 内置了 `write-note.md`（版本 19）与 `reorganize-library.md`（版本 3），并在 Zotero 启动时播种至 `<ZoteroDataDir>/agent-runtime/profile-<hash>/.agents/skills/`（在本机测试环境即 `seededSkillsDir`）。
+   - 插件在 `prefs.js` 中维护 `extensions.zotero.llmForZotero.skillBodyHashes`（FNV-1a 校验映射），当用户或桥接器修改 `.agents/skills/*.md` 后，插件会保留用户修改而不会静默覆盖；同时 `write-note.md` 明确声明：**"User customizations take precedence over formatting defaults, within the current request and host permissions."**
+2. **双路持久化管线（Zotero 原生笔记 vs Obsidian Markdown）**：
+   - **Zotero 原生笔记（`note_write` / `note_write_batch`）**：
+     - 严格省略 YAML frontmatter，默认精读结构为：`Paper Title -> Summary -> Key Findings -> Methodology -> My Notes -> References -> --- / Written by LLM-for-Zotero.`。
+     - 支持原样保存已有回复（传递 `sourceMessageId` 时禁止改写内容）；支持内嵌 `paper_read({ mode: "figures" })` 返回的 `file://` 图表裁剪链接（由 `note_write` 自动导入与校验）。
+     - 将模型生成的“批判性问题/疑问”与用户自己的 `My Notes` 严格区分。
+   - **Obsidian / Markdown 文件导出（`submit_document` -> `file_io`）**：
+     - 先调用 `submit_document` 定稿（绑定宿主机生成的 figure assets 与 `documentEvidenceRefs`），再将返回的 `documentId` 与 `visibleMarkdown` 传给 `file_io` 写入配置的 `obsidianVaultPath` 目录及相对附件目录 `obsidianAttachmentsFolder`。
+     - 完整精读 Markdown 默认 YAML frontmatter 为：`title`, `citekey`, `doi`, `year`, `journal`, `created`, `tags: [zotero, paper-note]`；通用笔记为 `title`, `created`, `tags: [zotero]`。
+     - 引用格式强制约定：仅当 `citekey` 非空时使用 `[@citekey]`，否则使用可读的 Author-Year 引述。
+3. **桥接器模板定制架构设计方案**：
+   - **三层注入机制**：支持 `AGY_NOTE_TEMPLATE_FILE` 环境变量或默认读取 `~/.agy-zotero-bridge/templates.json`（与 `prefs.js` `notesDirectoryNickname` 兼容），按 `zotero_note`、`markdown_obsidian` 与 `tag_taxonomy` 三部分覆盖预设结构。
+   - **首轮无污染注入**：仅在非续接首轮通过 `src/context/prompt-builder.mjs` 注入模板约定，同时在 `rules/AGENTS.md` 中保留“仅在用户显式请求写笔记或打标签时生效”、“先通过 `library_search` 复用现有标签与集合避免重复创建”、“写后立刻 `library_read`/`file_io` 回读核验”四项安全守则。
+   - **范围保护**：当用户请求的是“仅保存原回答（`sourceMessageId`）”或“仅导出某张图表裁剪（figure-only）”时，桥接器提示词明确禁止强行套用完整精读模板。
+
+### 9.2 `M7-01` 常驻进程池默认化与首字时延（TTFT）调优研究
+
+1. **双拓扑运行态对比（Managed CLI Shim vs Custom HTTP Bridge）**：
+   - **Managed 模式（`claude-code-agy.mjs` / `dist/agy-zotero-bridge.mjs` + Zotero `content/claude-bridge/bridge.mjs`）**：
+     - 经核查 `content/claude-bridge/bridge.mjs`，上游自带 `hotRuntimePool`（通过 `startHotTurn`、`retainHotRuntime`、`warmHotRuntime` 与 `/runtime-retention` 控制生命周期），可将 `claude-code-agy.mjs` 进程本身保持为 stdio 常驻热进程。
+     - 但目前 `cli-shim.mjs` 的 `executeTurn()` 在每一轮内部仍对 `agy.exe` 采用短生命周期 `-p ... --conversation <id>` 单轮拉起方式，未复用 `agy.exe` 本身的 `--input-format stream-json --output-format stream-json --print=` 长驻子进程。
+   - **Custom HTTP Bridge 模式（`bridge.mjs --bridge`）**：
+     - 桥接器已实现基于 `SessionProcessPool`（`src/agy/process-pool.mjs`）的 M4 进程池（`AGY_PROCESS_POOL=1` 时启用），通过 `conversationKey` 复用热 `agy.exe` 子进程，使用 `normalizeCumulativeUsage()` 处理累计 token 转增量 delta。
+2. **每轮 `X-LLM-For-Zotero-Scope` 热轮换兼容性机制（重要发现）**：
+   - 核查 `zotero-llm` 源码确认：`X-LLM-For-Zotero-Scope` 请求头是每轮动态生成、回合结束即失效的临时作用域令牌，且在工具调用中通过 HTTP Header 传给 `http://127.0.0.1:23119/llm-for-zotero/mcp`。
+   - **为什么常驻 `agy.exe` 无需因此重启**：桥接器每轮在写入 stdin `user` 消息前先调用 `prepareScopedMcpPlugin()` 覆盖更新 `<cwd>/.agents/zotero-mcp-headers.json`，而 `src/mcp/stdio-http-proxy.mjs` 在 `runProxy()` 每次收到来自 `agy.exe` 的 JSON-RPC 请求时都会重新执行 `loadProxyTarget()` 读取最新 `zotero-mcp-headers.json`。因此常驻 `agy.exe` + 常驻 stdio proxy 组合**天然支持跨轮 Scope Token 热更新**。
+3. **默认化前必须满足的三项安全/工程约束**：
+   - **约束 1：完整配置签名隔离（已在本轮修复）**：除 `cwd/model/effort/permissionMode/allowWriteForTurn` 外，`mcpSettingsFile` 与 `readDirs`（`--add-dir`）变化时必须触发 `poolSignature` 失效并重建 `agy.exe`（已在 `src/agy/process-runner.mjs` 修复补充）；`plan` 模式或 `localDocuments` 原生 PDF 轮次必须继续绕过池化以确保强隔离。
+   - **约束 2：`--print-timeout` 作用域陷阱**：实测 `agy.exe 1.5.9` 传入 `--input-format stream-json --print-timeout <T>` 时，该超时若作用于常驻进程总存活时长或空转上限，长期挂机可能导致暖进程意外退出；默认化前需在 `poolSignature` / `createPooledChildRuntime` 中配合最大存活轮次/最大生命周期轮换（例如达到 20 轮或接近 TTL 时优雅回收重拉），并将单轮超时严格交由桥接器 `AbortController` 控制。
+   - **约束 3：取消与异常崩溃防重放隔离**：当某轮发生网络中断、客户端 `abort` 或 429 重试切换时，必须立即 `killProcessTree` 并 `processPool.invalidate(key)`，严禁在已发生过工具副作用（`settledToolCount > 0`）的脏进程上静默续跑。
+
+### 9.3 `M7-02` 本地语义向量检索桥接（Semantic Search Bridge）研究
+
+1. **上游插件向量配置与调用契约（`llmforzotero.js`）**：
+   - 通过核查 `callEmbeddings`、`getResolvedEmbeddingConfig`、`resolveAutoEmbeddingProvider` 与 `orderEmbeddingResponse` 确认：
+     - Zotero 首选项键为：`enableSemanticSearch`、`embeddingProvider`、`embeddingApiBase`、`embeddingApiKey`、`embeddingModel`。
+     - 协议形态：完全采用 **OpenAI Compatible `POST <embeddingApiBase>/embeddings`**，请求体 `{ model, input }`（支持字符串或字符串数组批量输入），响应体期望 `{ data: [{ index, embedding: number[] }] }`（按 `index` 排序提取浮点数组）。
+     - **关键发现**：`callEmbeddings` 源码中明确判断 `if (!apiKey && embeddingProvider !== "custom") throw ...`，即当用户在 Zotero 设置中选择 `custom` 作为 `embeddingProvider` 时，**允许 `embeddingApiKey` 为空**，非常适合直连本地 `127.0.0.1` 代理服务！
+2. **`agy.exe 1.5.9` 能力边界确认**：
+   - 对 `agy.exe 1.5.9` 全部命令行接口的调研表明：`agy` 是交互/无头对话与编码 Agent CLI，**没有暴露独立的向量嵌入子命令（如 `agy embeddings`）或返回原始 `float[]` 稠密向量的开关**。因此不能强行让 `agy.exe` 伪造或计算向量数值。
+3. **可行的三条技术实施路径评估**：
+   - **路径 1（零开发直连方案 — 推荐个人快速使用）**：
+     - 用户直接在 Zotero 设置 -> 自定义 -> Semantic Search 中配置 `embeddingProvider: "gemini"`（配合 `https://generativelanguage.googleapis.com/v1beta/openai` + `gemini-embedding-001`）或本地运行 **Ollama**（`embeddingProvider: "custom"`, `embeddingApiBase: "http://127.0.0.1:11434/v1"`, `embeddingModel: "bge-m3"` / `"nomic-embed-text"`），无需经由桥接器二次中转。
+   - **路径 2（桥接器 `/v1/embeddings` 本地缓存与限流代理 — 后续可实现项）**：
+     - 在 `src/http/server.mjs` 新增仅监听回环地址的 `POST /v1/embeddings` 端点，Zotero 配置 `embeddingProvider = "custom"`、`embeddingApiBase = "http://127.0.0.1:8765/v1"`。
+     - 桥接器负责：(a) 基于文本内容 SHA-256 的本地持久化向量缓存（`<stateDir>/embeddings-cache.sqlite` 或分片 JSON），避免重建索引或切换模型重复计费；(b) 自动分批限流退避（应对 Gemini/OpenAI 批量嵌入 429）；(c) 统一转发到用户配置的本机 Ollama 或上游 Embedding API。
+   - **路径 3（Zotero MCP 内置混合检索互补 — 现有即用）**：
+     - 在用户未开启 Semantic Search（如本机 `enableSemanticSearch: false`）时，通过已打通的 Zotero MCP 工具 `library_retrieve`（`enumerate` / `summarize` / `verify`）配合多同义词查询变体，已经能够直接面向本地全文索引实现高质量的跨文献证据检索，与语义向量检索形成天然互补。
 
 ## 6. Coding Agent 的执行规则
 

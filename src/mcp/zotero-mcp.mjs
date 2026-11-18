@@ -409,8 +409,11 @@ export function buildScopedAgySettings({ serverNames = [], allowedTools = [], re
     const dir = String(rawDir || '').trim();
     if (!dir || dir === '/' || dir === '*' || /^[A-Za-z]:[\\/]?$/.test(dir)) continue;
     allowSet.add(`read_file(${dir})`);
+    allowSet.add(`view_file(${dir})`);
     if (dir.includes('\\')) {
-      allowSet.add(`read_file(${dir.replace(/\\/g, '/')})`);
+      const posixDir = dir.replace(/\\/g, '/');
+      allowSet.add(`read_file(${posixDir})`);
+      allowSet.add(`view_file(${posixDir})`);
     }
   }
 
@@ -435,11 +438,12 @@ export function buildScopedZoteroRulesMarkdown({ serverNames = [], allowWrite = 
     '1. **Direct Zotero MCP Tool Usage**: Use `call_mcp_tool` on the active Zotero MCP server(s) (' +
       serversList +
       ') for Zotero library searches (`library_search`), reading items/notes/fulltext (`library_read`, `library_retrieve`, `paper_read`), and loading Zotero skills (`load_skill`). Do NOT run shell commands (`run_command`), because shell execution is disabled in headless safe mode.',
-    '2. **Close Reading a Paper (`paper_read`)**: Omit `activeItemId` and `activeContextItemId` to target the active paper in the current chat turn. Call `paper_read({ mode: "overview" })` at most once for high-level summary/metadata, then call `paper_read({ mode: "outline" })` to get the section list (`sectionIds` and chunk ranges), and then call `paper_read({ mode: "targeted", sectionIds: [...] })` or `paper_read({ mode: "targeted", query: "..." })` for detailed methodology, experimental setup, results, and discussion (or `mode: "figures"` / `mode: "visual"` for figures). Do NOT repeat identical `paper_read({ mode: "overview" })` calls, and prefer `paper_read` (`outline` -> `targeted`) or `library_read` over guessing local file paths.',
-    '3. **Multi-Paper Citation & Modality Honesty**: When answering across multiple papers, always attribute findings explicitly by paper title, author/year, and Zotero `itemKey`/`itemId` without mixing content across papers. Distinguish extracted/indexed text read via MCP or text tools from charts or figure pixels that were not directly inspected.',
+    '2. **Close Reading & Multimodal Figures (`paper_read`)**: Omit `activeItemId` and `activeContextItemId` to target the active paper in the current chat turn. Call `paper_read({ mode: "overview" })` at most once for high-level summary/metadata, then call `paper_read({ mode: "outline" })` to get the section list (`sectionIds` and chunk ranges), and then call `paper_read({ mode: "targeted", sectionIds: [...] })` or `paper_read({ mode: "targeted", query: "..." })` for detailed methodology, experimental setup, results, and discussion. For figure/table/diagram questions, call `paper_read({ mode: "figures", figureLabels: [...] })` (or `mode: "visual"` for rendered pages / `mode: "capture"` for the active reader view), and use `read_file` or `view_file` on any returned figure crop paths (`artifacts[].storedPath`) or materialized image paths from this prompt to inspect panels visually alongside captions and `targeted` text. Use returned crop `file://` links as-is in `note_write`; do NOT inspect `figure_crops` metadata or read/embed raw MinerU source image paths. If crop extraction fails (`no_figures` / `error`), state clearly that analysis relies on captions and text only.',
+    '3. **Multi-Paper Citation & Modality Honesty**: When answering across multiple papers, always attribute findings explicitly by paper title, author/year, and Zotero `libraryID`/`itemKey`/`itemId` without mixing content across papers. Clearly separate direct textual evidence from visual inspection of crop/screenshot images, and never claim to have inspected pixels that were not opened via `read_file`/`view_file`.',
     allowWrite
       ? '4. **Direct Zotero Library Modification & Readback Verification**: Write tools (`note_write`, `note_write_batch`, `library_update`, `library_import`, `library_delete`, `annotate_pdf`, `file_io`, `undo`, `zotero_script`, etc.) are enabled (`writeEnabled: true`) and may be invoked directly via `call_mcp_tool` to create or modify Zotero notes, tags, collections, and items. Before modifying items, notes, or tags, inspect the target item first, support dry-run preview if requested, and immediately read back the modified item/note via `library_read` or `paper_read` to confirm the change succeeded.'
-      : '4. **Strict Read-Only Mode**: Write mode is disabled (`writeEnabled: false`). Only invoke read-only Zotero MCP tools; do not attempt to create/edit notes, tags, metadata, or delete library items, and clearly inform the user if a task requires write permission.'
+      : '4. **Strict Read-Only Mode**: Write mode is disabled (`writeEnabled: false`). Only invoke read-only Zotero MCP tools; do not attempt to create/edit notes, tags, metadata, or delete library items, and clearly inform the user if a task requires write permission.',
+    '5. **Batch Literature Review & Ultra-Long Context (8–50+ Papers)**: When comparing or reviewing many papers or a collection/tag scope, never try to read every full paper in one unbatched step. Follow a 3-tier strategy: (a) establish the paper ledger using the supplied Multi-Paper Scope Manifest, `library_search`, `library_retrieve({ intent: "enumerate" | "summarize" })`, or `paper_digest`; (b) batch `paper_read` with `targets` (3–6 related papers per call) and drill down via `mode: "outline"` -> `mode: "targeted"`; (c) record coverage via `review_coverage` / `record_paper_decisions` and explicitly state the coverage frontier (how many papers were read in full vs in part vs metadata-only) and preserve negative or contradictory findings.'
   ];
   return lines.join('\n') + '\n';
 }

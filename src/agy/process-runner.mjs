@@ -427,7 +427,7 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
       .toLowerCase();
     const allowWriteForTurn = effectivePermissionMode === 'plan' ? false : config.zoteroMcpAllowWrite;
 
-    const built = await buildTurnPrompt(b, { resumed: Boolean(oldId), config });
+    const built = await buildTurnPrompt(b, { resumed: Boolean(oldId), config, cwd });
     localPdfReplacements = built.localPdfReplacements;
 
     let mcpSettingsFile = '';
@@ -507,7 +507,9 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
         model,
         effort,
         effectivePermissionMode,
-        allowWriteForTurn
+        allowWriteForTurn,
+        mcpSettingsFile,
+        readDirs: built.extraAddDirs
       });
       let poolEntry = processPool.get(key);
       const isLiveSameSignature = Boolean(
@@ -598,75 +600,128 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
         args.push('--add-dir', dir);
       }
 
-      child = spawn(config.binary, [...config.prefixArgs, ...args], {
-        cwd,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
-      });
+      for (let attempt = 0; attempt <= config.rateLimitMaxRetries; attempt += 1) {
+        stderr = '';
+        exitInfo = { code: null, signal: null };
+        child = spawn(config.binary, [...config.prefixArgs, ...args], {
+          cwd,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true
+        });
 
-      let childError = null;
-      child.on('error', (e) => {
-        childError = e;
-      });
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (d) => {
-        stderr = (stderr + d).slice(-config.maxStderr);
-      });
+        let childError = null;
+        child.on('error', (e) => {
+          childError = e;
+        });
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (d) => {
+          stderr = (stderr + d).slice(-config.maxStderr);
+        });
 
-      const onAbort = () => killProcessTree(child);
-      controller.signal.addEventListener('abort', onAbort, { once: true });
+        const onAbort = () => killProcessTree(child);
+        controller.signal.addEventListener('abort', onAbort, { once: true });
 
-      const exitTracker = waitForExitBounded(child, 1500);
-      const mapper = createTurnEventMapper({
-        runId,
-        model,
-        onEvent: emitSanitizedEvent,
-        onTools,
-        maxNdjsonLine: config.maxNdjsonLine,
-        extraSecrets: [config.token]
-      });
+        const exitTracker = waitForExitBounded(child, 1500);
+        const mapper = createTurnEventMapper({
+          runId,
+          model,
+          onEvent: emitSanitizedEvent,
+          onTools,
+          maxNdjsonLine: config.maxNdjsonLine,
+          extraSecrets: [config.token]
+        });
 
-      const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
-      try {
-        for await (const line of rl) {
-          if (controller.signal.aborted) break;
-          mapper.processLine(line);
+        let mapperError = null;
+        const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+        try {
+          for await (const line of rl) {
+            if (controller.signal.aborted) break;
+            try {
+              mapper.processLine(line);
+            } catch (err) {
+              mapperError = err;
+              killProcessTree(child);
+              break;
+            }
+          }
+        } finally {
+          rl.close();
+          controller.signal.removeEventListener('abort', onAbort);
         }
-      } finally {
-        rl.close();
-        controller.signal.removeEventListener('abort', onAbort);
-      }
 
-      exitInfo = controller.signal.aborted
-        ? await exitTracker.awaitBounded()
-        : await exitTracker.awaitNormal();
+        exitInfo = controller.signal.aborted
+          ? await exitTracker.awaitBounded()
+          : await exitTracker.awaitNormal();
 
-      if (childError) throw childError;
-      if (timedOut) {
-        const err = new Error(`agy turn timed out after ${timeoutMs}ms`);
-        err.errorCode = 'timeout';
-        throw err;
-      }
-      if (controller.signal.aborted) {
-        const err = new Error('cancelled');
-        err.errorCode = 'cancelled';
-        throw err;
-      }
+        if (childError) throw childError;
+        if (timedOut) {
+          const err = new Error(`agy turn timed out after ${timeoutMs}ms`);
+          err.errorCode = 'timeout';
+          throw err;
+        }
+        if (controller.signal.aborted) {
+          const err = new Error('cancelled');
+          err.errorCode = 'cancelled';
+          throw err;
+        }
 
-      state = mapper.getState();
-      if (!state.resultSeen) {
-        const snippet = stderr ? `: ${stderr.slice(-1200)}` : '';
-        const err = new Error(`agy exited without a terminal result${snippet}`);
-        err.errorCode = 'missing_result';
-        throw err;
-      }
-      if (exitInfo.code !== 0) {
-        const err = new Error(`agy process exited with code ${exitInfo.code}: ${stderr.slice(-1200)}`);
-        err.errorCode = 'process_exit_error';
-        throw err;
-      }
-      if (!state.success) {
-        throw new Error('agy did not complete successfully');
+        const attemptState = mapper.getState();
+        let attemptErr = mapperError;
+        if (!attemptErr && !attemptState.resultSeen) {
+          const snippet = stderr ? `: ${stderr.slice(-1200)}` : '';
+          attemptErr = new Error(`agy exited without a terminal result${snippet}`);
+          attemptErr.errorCode = 'missing_result';
+        } else if (!attemptErr && exitInfo.code !== 0) {
+          attemptErr = new Error(`agy process exited with code ${exitInfo.code}: ${stderr.slice(-1200)}`);
+          attemptErr.errorCode = 'process_exit_error';
+        } else if (!attemptErr && !attemptState.success) {
+          attemptErr = new Error('agy did not complete successfully');
+        }
+
+        if (!attemptErr) {
+          state = attemptState;
+          break;
+        }
+
+        const classified = classifyAgyError(attemptErr.message, stderr, exitInfo.code, [config.token]);
+        if (
+          classified.code === 'rate_limited' &&
+          !controller.signal.aborted &&
+          attemptState.settledToolCount === 0 &&
+          attempt < config.rateLimitMaxRetries
+        ) {
+          killProcessTree(child);
+          child = null;
+          emitEventRaw({
+            type: 'status',
+            text: `Rate limit (429) encountered; retrying turn after backoff (${attempt + 1}/${config.rateLimitMaxRetries})...`
+          });
+          await new Promise((resolveDelay) => {
+            const delayMs = config.rateLimitRetryDelayMs * (attempt + 1);
+            const t = setTimeout(() => {
+              controller.signal.removeEventListener('abort', onBackoffAbort);
+              resolveDelay();
+            }, delayMs);
+            const onBackoffAbort = () => {
+              clearTimeout(t);
+              resolveDelay();
+            };
+            controller.signal.addEventListener('abort', onBackoffAbort, { once: true });
+          });
+          if (timedOut) {
+            const err = new Error(`agy turn timed out after ${timeoutMs}ms`);
+            err.errorCode = 'timeout';
+            throw err;
+          }
+          if (controller.signal.aborted) {
+            const err = new Error('cancelled');
+            err.errorCode = 'cancelled';
+            throw err;
+          }
+          continue;
+        }
+
+        throw attemptErr;
       }
     }
 

@@ -18,6 +18,12 @@ test('single-file bundle exports matches source interface', () => {
   assert.equal(typeof bundle.startBridgeServer, 'function');
   assert.equal(typeof bundle.runClaudeCodeAgyShim, 'function');
   assert.equal(typeof bundle.parseClaudeShimArgs, 'function');
+  assert.equal(typeof bundle.extractSdkUserImageBlocks, 'function');
+  assert.equal(typeof bundle.parseImageDataUrl, 'function');
+  assert.equal(typeof bundle.validateImageBuffer, 'function');
+  assert.equal(typeof bundle.materializeTurnImages, 'function');
+  assert.equal(typeof bundle.extractPaperScopeManifest, 'function');
+  assert.equal(typeof bundle.compactRuntimeContext, 'function');
   assert.equal(typeof bundle.CliProbe, 'function');
   assert.equal(typeof bundle.SessionStore, 'function');
   assert.equal(typeof bundle.SessionProcessPool, 'function');
@@ -113,6 +119,26 @@ test('single-file bundle responds to stream-json initialize and set_model cleanl
       'set_model control response'
     );
     assert.equal(modelResp.response.subtype, 'success');
+
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+    child.stdin.write(JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'MOCK_ECHO_IMAGE_PATHS' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngBytes.toString('base64') } }
+        ]
+      }
+    }) + '\n');
+
+    const resultResp = await waitForFrame(
+      (l) => l.type === 'result' && l.subtype === 'success',
+      'multimodal bundle user turn result'
+    );
+    const echoed = JSON.parse(resultResp.result);
+    assert.equal(echoed.paths.length, 1);
+    assert.equal(echoed.fileSizes[0], pngBytes.length);
 
     child.stdin.end();
     await new Promise((r) => child.on('close', r));

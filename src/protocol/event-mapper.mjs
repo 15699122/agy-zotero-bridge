@@ -31,9 +31,16 @@ export function classifyAgyError(rawMessage, stderr = '', exitCode = 0, extraSec
   }
 
   const base = str(rawMessage) || String(rawMessage ?? '') || `agy exited with code ${exitCode}`;
+  let reason = redactSensitive(base, extraSecrets);
+  if (
+    code === 'rate_limited' &&
+    !/reduce batch|lower thinking effort|switch model/i.test(reason)
+  ) {
+    reason = `${reason} (Hint: reduce batch paper count, lower thinking effort, or switch model and retry.)`;
+  }
   return {
     code,
-    reason: redactSensitive(base, extraSecrets)
+    reason
   };
 }
 

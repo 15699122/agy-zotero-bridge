@@ -132,12 +132,18 @@ export {
   CliProbe,
   SessionProcessPool,
   SessionStore,
+  compactRuntimeContext,
   createBridgeApp,
   createConfig,
   ensureWindowsClaudeCmdShim,
+  extractPaperScopeManifest,
+  extractSdkUserImageBlocks,
+  materializeTurnImages,
   parseClaudeShimArgs,
+  parseImageDataUrl,
   runClaudeCodeAgyShim,
-  startBridgeServer
+  startBridgeServer,
+  validateImageBuffer
 };
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

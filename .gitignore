@@ -6,3 +6,4 @@ sessions.json
 *.log
 .env
 .env.*
+dist/agy-zotero-bridge.mjs
