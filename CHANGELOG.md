@@ -1,6 +1,10 @@
 # Changelog
 
-## v1.0.0 (2026-11-17)
+## v1.0.0 (2026-11-18)
+
+### Added (Single-File Release Bundle & GitHub Actions Workflow)
+- **Single-File Release Bundle (`dist/agy-zotero-bridge.mjs` & `dist/agy-zotero-bridge.cmd`)**: Fully self-contained single-file release bundle built with `scripts/bundle.mjs`. Inlines all submodules into zero-external-dependency executable that functions both as a direct Claude Code CLI shim and standalone HTTP bridge with internal `--proxy-mcp` dispatch.
+- **GitHub Actions Automated Release Workflow (`.github/workflows/release.yml`)**: Automatically runs the test suite, bundles the single-file artifacts, verifies the bundle, calculates SHA256 checksums, and publishes official GitHub Releases upon tagging `v*`.
 
 ### Fixed (Base Model & Thinking Level Separation)
 - **Grouped Model Catalog & `(model, effort)` Normalization (`src/agy/cli-probe.mjs`, `src/agy/process-runner.mjs`)**: Added `splitModelVariant` and `resolveAgyModelAndEffort` so `agy models` thinking-level variants (e.g. `gemini-3.8-flash-low/medium/high`, `gemini-4-hydrogen-xhigh`, `claude-opus-5-5-*`, `claude-sonnet-5-5-*`, `gpt-oss-120b-medium`) are grouped into clean base models with `supportedEffortLevels` in `GET /models`, letting Zotero's `默认模型` dropdown select the model and `默认推理` select the Thinking Level independently. `GET /efforts`, `runTurnStream`, and `runStructuredCompletion` normalize both base IDs and legacy suffixed IDs, omit `--effort` when Zotero sends `'auto'`/`'default'`, clamp unsupported `xhigh`/`max` requests safely, and preserve fixed-effort models (`gemini-pro-orchestrator-g1-pro`, `gpt-oss-120b`).

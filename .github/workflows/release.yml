@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run test suite
+        run: npm run test:unit
+
+      - name: Build single-file release bundle
+        run: npm run bundle
+
+      - name: Run bundle verification tests
+        run: node --test test/bundle.test.mjs
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          cp dist/agy-zotero-bridge.mjs release-assets/agy-zotero-bridge.mjs
+          cp dist/agy-zotero-bridge.cmd release-assets/agy-zotero-bridge.cmd
+          cd release-assets
+          sha256sum agy-zotero-bridge.mjs agy-zotero-bridge.cmd > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release-assets/agy-zotero-bridge.mjs
+            release-assets/agy-zotero-bridge.cmd
+            release-assets/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false

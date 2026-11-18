@@ -8,7 +8,18 @@ Both modes provide grouped base-model discovery + independent Thinking Level (`e
 
 ## 1. Quick Setup (Windows / PowerShell)
 
-### Option A: Direct `Claude Code path` (Recommended, Managed by Zotero)
+### Option 0: Single-File Release (Zero Repository Cloning Required)
+Download `agy-zotero-bridge.mjs` (and optionally `agy-zotero-bridge.cmd`) from [GitHub Releases](https://github.com/15699122/agy-zotero-bridge/releases):
+1. Place `agy-zotero-bridge.mjs` anywhere on your computer (e.g. `C:\Tools\agy-zotero-bridge.mjs`).
+2. Open Zotero → **Settings** → **llm-for-zotero** → **Agent** → expand **高级 / Advanced**:
+   - Uncheck **Use my own bridge**.
+   - In **Claude Code path**, enter the full path:
+     ```text
+     C:\Tools\agy-zotero-bridge.mjs
+     ```
+3. Click **Restart bridge** and **刷新** (Refresh models).
+
+### Option A: Direct `Claude Code path` from Source Repository
 1. Install **Node.js 20+** and authenticate `agy` (`agy --version` / `agy models`).
    *(On Windows, the bridge automatically checks `%USERPROFILE%\.gemini\bin\agy.exe` if `AGY_BIN` is unset.)*
 2. Open Zotero → **Settings** → **llm-for-zotero** → **Agent** → expand **高级 / Advanced**:
