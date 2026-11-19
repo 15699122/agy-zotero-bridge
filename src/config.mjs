@@ -2,7 +2,7 @@ import { accessSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
-export const BRIDGE_VERSION = 'agy-v1.1.0';
+export const BRIDGE_VERSION = 'agy-v1.2.0';
 
 function parseStringArrayEnv(raw, envName) {
   if (!raw) return [];

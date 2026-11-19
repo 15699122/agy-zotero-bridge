@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 (2026-11-19)
 
 ### Added (MinerU `.md` + `.doc`/`.docx` Supporting Information Routing & Proxy Diagnostics)
 - **Attachment-Aware Workspace Rules (`src/mcp/zotero-mcp.mjs`, `src/context/prompt-builder.mjs`)**: Updated `buildScopedZoteroRulesMarkdown()` so PDF attachments use `paper_read`, while MinerU `.md` primary papers (without a PDF), `.txt`, `.html`, and `.docx` Supporting Information use `read_attachment({ target: { contextItemId } })` directly (re-calling with higher `maxChars` when truncated at `50,000` chars). Permitted selective `view_file`/`read_file` inspection of MinerU figures when no PDF exists, while warning against `.doc` binary limitations and text-only `.docx` image omissions; preserved `attachmentTitle` and `contentSourceMode` in `extractPaperScopeManifest()` and inspected `attachmentPath`/`filePath` in `collectContextDirectoriesFromRuntime()`.
