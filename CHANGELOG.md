@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased (v1.1.0-dev)
+## Unreleased
+
+### Added (Google `agy 1.5.11` Model Catalog Update & Version-Aware Cache Refresh)
+- **New Google Models (`src/agy/cli-probe.mjs`, `test/fixtures/ndjson-samples.mjs`)**: Added full capability and `(model, effort)` normalization support for **`Gemini 4 Neon`** (`gemini-4-neon` with `low`, `medium`, `high`, `xhigh`), **`Orchestrator (Neon)`** (`gemini-pro-orchestrator-neon` without `--effort`), **`Gemini 4 Carbon`** (`gemini-4-carbon` with `low`, `medium`, `high`), and any future `gemini-pro-orchestrator-*` orchestrator IDs (such as `gemini-pro-orchestrator-carbon`).
+- **Dynamic Live Catalog Lookup & Unknown Suffixed Variant Fallback (`src/agy/cli-probe.mjs`, `src/agy/process-runner.mjs`, `src/http/server.mjs`, `src/claude-sdk/cli-shim.mjs`)**: Passed live-discovered `cliProbe.modelsCache.infos` into `resolveAgyModelAndEffort` across `/run-turn`, `/structured-completion`, and `cli-shim.mjs` so newly rolled-out models benefit from accurate `max`/`xhigh` clamping immediately upon discovery; updated fallback normalization for unknown suffixed IDs (e.g. `gemini-5-future-low`) while keeping conservative `['default']` capabilities for unknown custom models.
+- **Version-Aware `models-cache.json` Invalidation & Configurable TTL (`src/config.mjs`, `src/agy/cli-probe.mjs`)**: Added `isDiskModelCacheValid()` and `AGY_MODELS_CACHE_TTL_MS` (default `15m`). Replaced the previous 24-hour unversioned disk cache with version-checked invalidation keyed on both `bridgeVersion` and live `agy --version`, automatically refreshing when `agy.exe` or the bridge updates (while falling back to `stale-disk-cache` only if live probing fails).
+- **Tests (`test/unit.test.mjs`, `test/bridge.test.mjs`, `test/bundle.test.mjs`)**: Expanded suite to **61 / 61** passing tests (`32` unit + `3` bundle + `26` integration), verifying real `agy.exe 1.5.11` 23-variant -> 9-base-model parsing, `Gemini 4 Neon` / `Gemini 4 Carbon` / `Orchestrator (Neon)` HTTP `/efforts` & `/run-turn` normalization, and `isDiskModelCacheValid` invalidation rules.
+
+## v1.1.0 (2026-11-19)
 
 ### Added (`M7-01`: Persistent Process Pool Defaultization & TTFT Tuning)
 - **Retention-Aware Default Process Pool & Turn/Age Rotation (`src/config.mjs`, `src/agy/process-pool.mjs`, `src/agy/process-runner.mjs`, `src/agy/cli-probe.mjs`, `bridge.mjs`)**: Enabled `processPoolEnabled` by default (`AGY_PROCESS_POOL=0` disables, `AGY_PROCESS_POOL=1` forces pooling even for unmounted one-off HTTP turns) alongside `AGY_POOL_MAX_TURNS` (default `20`) and `AGY_POOL_MAX_AGE_MS` (default `25m`). Mounted Zotero chat tabs (`/runtime-retention` `retain: true`) automatically reuse warm `--input-format stream-json` `agy` children across turns, scale `--print-timeout` past `poolMaxProcessAgeMs`, preserve retention across automatic turn/age rotation (`keepRetained: true`), expose `processPool` status in `GET /healthz`, and terminate pooled children via `app.close()` on bridge shutdown.

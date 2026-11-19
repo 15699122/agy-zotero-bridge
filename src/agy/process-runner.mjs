@@ -396,7 +396,7 @@ async function runPooledTurn({
  * Executes a single streaming `/run-turn` against agy headless `--output-format stream-json`
  * (or reuses a warm `--input-format stream-json` child when retained or `AGY_PROCESS_POOL=1`).
  */
-export async function runTurnStream({ body, res, config, sessionStore, processPool, onTools, onMcpConfigured }) {
+export async function runTurnStream({ body, res, config, sessionStore, processPool, knownModels = [], onTools, onMcpConfigured }) {
   const runId = 'agy-' + randomUUID();
   let localPdfReplacements = [];
 
@@ -511,7 +511,7 @@ export async function runTurnStream({ body, res, config, sessionStore, processPo
 
     const rawModel = str(metadata.model || config.defaultModel);
     const rawEffort = str(metadata.effort || config.defaultEffort);
-    const { model, effort } = resolveAgyModelAndEffort(rawModel, rawEffort);
+    const { model, effort } = resolveAgyModelAndEffort(rawModel, rawEffort, knownModels);
 
     if (controller.signal.aborted) {
       throw new Error('cancelled');
@@ -960,7 +960,7 @@ function extractSchema(body, config) {
  * Executes a stateless, non-conversational completion for `POST /structured-completion`.
  * Supports optional `--json-schema` enforcement and strictly isolates from session storage.
  */
-export async function runStructuredCompletion({ body, res, config }) {
+export async function runStructuredCompletion({ body, res, config, knownModels = [] }) {
   const b = record(body);
   const prompt = buildStructuredPrompt(b);
   if (prompt.length > config.maxPrompt) {
@@ -971,7 +971,7 @@ export async function runStructuredCompletion({ body, res, config }) {
   const timeoutMs = clampTimeout(b.timeoutMs ?? record(b.metadata).timeoutMs, config.defaultStructuredTimeoutMs);
   const rawModel = str(b.model || record(b.metadata).model || config.defaultModel);
   const rawEffort = str(b.effort || record(b.metadata).effort || config.defaultEffort);
-  const { model, effort } = resolveAgyModelAndEffort(rawModel, rawEffort);
+  const { model, effort } = resolveAgyModelAndEffort(rawModel, rawEffort, knownModels);
   const perm = permissionArgs(
     { metadata: { permissionMode: str(b.permissionMode || record(b.metadata).permissionMode || 'default') } },
     config

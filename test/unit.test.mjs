@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { inferModelCapabilities, parseModelsStdout, resolveAgyModelAndEffort, splitModelVariant } from '../src/agy/cli-probe.mjs';
+import {
+  inferModelCapabilities,
+  isDiskModelCacheValid,
+  parseModelsStdout,
+  resolveAgyModelAndEffort,
+  splitModelVariant
+} from '../src/agy/cli-probe.mjs';
 import { normalizeCumulativeUsage, SessionProcessPool } from '../src/agy/process-pool.mjs';
 import {
   ensureWindowsClaudeCmdShim,
@@ -36,6 +42,8 @@ import { redactSensitive, validateLocalFilePath } from '../src/security/redact.m
 import { SessionStore } from '../src/session/session-store.mjs';
 import {
   NDJSON_SAMPLES,
+  REAL_AGY_1_5_11_MODELS_JSON_STDOUT,
+  REAL_AGY_1_5_11_MODELS_TEXT_STDOUT,
   REAL_AGY_1_5_9_MODELS_JSON_STDOUT,
   REAL_AGY_1_5_9_MODELS_TEXT_STDOUT
 } from './fixtures/ndjson-samples.mjs';
@@ -1238,5 +1246,162 @@ test('stdio-http-proxy compacts bloated note_write / library_read responses, sho
         result: { conversation_id: 'c-fail', status: 'SUCCESS', finished_reason: 'print_timeout', response: '' }
       }),
     (err) => err.errorCode === 'timeout'
+  );
+});
+
+test('parseModelsStdout groups real agy 1.5.11 Neon & Orchestrator variants and resolves Carbon/future models', () => {
+  const jsonInfos = parseModelsStdout(REAL_AGY_1_5_11_MODELS_JSON_STDOUT);
+  assert.deepEqual(
+    jsonInfos.map((m) => m.value),
+    [
+      'gemini-4-neon',
+      'gemini-4-argon',
+      'gemini-4-hydrogen',
+      'gemini-pro-orchestrator-neon',
+      'gemini-pro-orchestrator-g1-pro',
+      'gemini-3.8-flash',
+      'claude-opus-5-5',
+      'claude-sonnet-5-5',
+      'gpt-oss-120b'
+    ]
+  );
+
+  const textInfos = parseModelsStdout(REAL_AGY_1_5_11_MODELS_TEXT_STDOUT);
+  assert.equal(textInfos.length, 9);
+  assert.deepEqual(
+    textInfos.map((m) => m.value),
+    jsonInfos.map((m) => m.value)
+  );
+
+  const neon = jsonInfos.find((m) => m.value === 'gemini-4-neon');
+  assert.equal(neon.displayName, 'Gemini 4 Neon');
+  assert.equal(neon.supportsEffort, true);
+  assert.equal(neon.supportsAdaptiveThinking, true);
+  assert.deepEqual(neon.supportedEffortLevels, ['low', 'medium', 'high', 'xhigh']);
+  assert.deepEqual(neon.supportedEfforts, ['default', 'low', 'medium', 'high', 'xhigh']);
+
+  const orchNeon = jsonInfos.find((m) => m.value === 'gemini-pro-orchestrator-neon');
+  assert.equal(orchNeon.displayName, 'Orchestrator (Neon)');
+  assert.equal(orchNeon.supportsEffort, false);
+  assert.deepEqual(orchNeon.supportedEffortLevels, []);
+  assert.deepEqual(orchNeon.supportedEfforts, ['default']);
+
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-neon', 'xhigh'), { model: 'gemini-4-neon', effort: 'xhigh' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-neon', 'max'), { model: 'gemini-4-neon', effort: 'xhigh' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-neon', 'auto'), { model: 'gemini-4-neon', effort: '' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-neon-low', 'auto'), { model: 'gemini-4-neon', effort: 'low' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-neon-low', 'high'), { model: 'gemini-4-neon', effort: 'high' });
+
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-carbon', 'max'), { model: 'gemini-4-carbon', effort: 'high' });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-4-carbon', 'low'), { model: 'gemini-4-carbon', effort: 'low' });
+
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-pro-orchestrator-neon', 'high'), {
+    model: 'gemini-pro-orchestrator-neon',
+    effort: ''
+  });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-pro-orchestrator-neon', 'xhigh'), {
+    model: 'gemini-pro-orchestrator-neon',
+    effort: ''
+  });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-pro-orchestrator-carbon', 'medium'), {
+    model: 'gemini-pro-orchestrator-carbon',
+    effort: ''
+  });
+
+  const knownModels = [
+    {
+      value: 'gemini-5-future',
+      displayName: 'Gemini 5 Future',
+      supportedEffortLevels: ['low', 'medium', 'high', 'xhigh']
+    }
+  ];
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-5-future', 'max', knownModels), {
+    model: 'gemini-5-future',
+    effort: 'xhigh'
+  });
+
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-5-future-low', 'high'), {
+    model: 'gemini-5-future',
+    effort: 'high'
+  });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-5-future-low', 'auto'), {
+    model: 'gemini-5-future',
+    effort: 'low'
+  });
+});
+
+test('isDiskModelCacheValid enforces TTL, bridgeVersion, and agyVersion invalidation rules', () => {
+  const now = 1_795_000_000_000;
+  const sampleInfos = [{ value: 'gemini-4-neon', displayName: 'Gemini 4 Neon' }];
+  const baseCache = {
+    at: now - 60_000,
+    bridgeVersion: 'agy-v1.1.0',
+    agyVersion: '1.5.11',
+    infos: sampleInfos
+  };
+
+  assert.equal(
+    isDiskModelCacheValid(baseCache, {
+      now,
+      ttlMs: 15 * 60_000,
+      bridgeVersion: 'agy-v1.1.0',
+      agyVersion: '1.5.11'
+    }),
+    true
+  );
+
+  // Missing bridgeVersion (legacy cache)
+  assert.equal(
+    isDiskModelCacheValid({ ...baseCache, bridgeVersion: '' }, {
+      now,
+      ttlMs: 15 * 60_000,
+      bridgeVersion: 'agy-v1.1.0',
+      agyVersion: '1.5.11'
+    }),
+    false
+  );
+
+  // Mismatched bridgeVersion
+  assert.equal(
+    isDiskModelCacheValid({ ...baseCache, bridgeVersion: 'agy-v1.0.0' }, {
+      now,
+      ttlMs: 15 * 60_000,
+      bridgeVersion: 'agy-v1.1.0',
+      agyVersion: '1.5.11'
+    }),
+    false
+  );
+
+  // Mismatched agyVersion (CLI auto-updated from 1.5.9 -> 1.5.11)
+  assert.equal(
+    isDiskModelCacheValid({ ...baseCache, agyVersion: '1.5.9' }, {
+      now,
+      ttlMs: 15 * 60_000,
+      bridgeVersion: 'agy-v1.1.0',
+      agyVersion: '1.5.11'
+    }),
+    false
+  );
+
+  // Expired TTL
+  assert.equal(
+    isDiskModelCacheValid({ ...baseCache, at: now - 16 * 60_000 }, {
+      now,
+      ttlMs: 15 * 60_000,
+      bridgeVersion: 'agy-v1.1.0',
+      agyVersion: '1.5.11'
+    }),
+    false
+  );
+
+  // Disabled TTL (ttlMs === 0)
+  assert.equal(
+    isDiskModelCacheValid(baseCache, {
+      now,
+      ttlMs: 0,
+      bridgeVersion: 'agy-v1.1.0',
+      agyVersion: '1.5.11'
+    }),
+    false
   );
 });

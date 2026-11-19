@@ -41,6 +41,11 @@ export function splitModelVariant(modelId, displayName = '') {
   };
 }
 
+function isOrchestratorModel(modelId) {
+  const lower = str(modelId).trim().toLowerCase();
+  return lower === 'gemini-pro-orchestrator' || lower.startsWith('gemini-pro-orchestrator-');
+}
+
 /**
  * Infers conservative effort levels and model capability flags from real agy model IDs.
  * Unknown models conservatively report only ['default'].
@@ -59,12 +64,15 @@ export function inferModelCapabilities(modelId, displayName = '', discoveredEffo
   }
 
   let rawLevels = [];
-  if (Array.isArray(discoveredEfforts) && discoveredEfforts.length > 0) {
+  if (isOrchestratorModel(lower)) {
+    rawLevels = [];
+  } else if (Array.isArray(discoveredEfforts) && discoveredEfforts.length > 0) {
     rawLevels = [...discoveredSet];
-  } else if (lower.startsWith('gemini-4-hydrogen')) {
+  } else if (lower.startsWith('gemini-4-neon') || lower.startsWith('gemini-4-hydrogen')) {
     rawLevels = [...new Set(['low', 'medium', 'high', 'xhigh', ...discoveredSet])];
   } else if (
     lower.startsWith('gemini-4-argon') ||
+    lower.startsWith('gemini-4-carbon') ||
     lower.startsWith('gemini-3.8-flash') ||
     lower.startsWith('claude-opus-5-5') ||
     lower.startsWith('claude-sonnet-5-5')
@@ -97,7 +105,7 @@ export function inferModelCapabilities(modelId, displayName = '', discoveredEffo
  * Resolves a requested (model, effort) pair—supporting both grouped base IDs and legacy
  * effort-suffixed IDs—into normalized `--model` and `--effort` CLI values.
  */
-export function resolveAgyModelAndEffort(rawModel, rawEffort) {
+export function resolveAgyModelAndEffort(rawModel, rawEffort, knownModels = []) {
   const modelInput = str(rawModel).trim();
   const effortNorm = str(rawEffort).trim().toLowerCase();
   const explicitEffort = !effortNorm || ['default', 'auto', 'none'].includes(effortNorm) ? '' : effortNorm;
@@ -108,12 +116,19 @@ export function resolveAgyModelAndEffort(rawModel, rawEffort) {
 
   const { baseId, effort: embeddedEffort } = splitModelVariant(modelInput);
   const desiredEffort = explicitEffort || embeddedEffort;
-  const caps = inferModelCapabilities(baseId);
-  const supported = caps.supportedEffortLevels;
 
-  if (baseId.toLowerCase() === 'gemini-pro-orchestrator-g1-pro') {
+  if (isOrchestratorModel(baseId)) {
     return { model: baseId, effort: '' };
   }
+
+  const knownList = Array.isArray(knownModels) ? knownModels : [];
+  const found = knownList.find((m) => str(m?.value).trim().toLowerCase() === baseId.toLowerCase());
+  const discovered =
+    Array.isArray(found?.supportedEffortLevels) && found.supportedEffortLevels.length > 0
+      ? found.supportedEffortLevels
+      : [];
+  const caps = inferModelCapabilities(baseId, str(found?.displayName), discovered);
+  const supported = caps.supportedEffortLevels;
 
   if (supported.length === 1) {
     return { model: baseId, effort: supported[0] };
@@ -133,6 +148,10 @@ export function resolveAgyModelAndEffort(rawModel, rawEffort) {
       model: baseId,
       effort: supported.includes('medium') ? 'medium' : supported[0]
     };
+  }
+
+  if (embeddedEffort) {
+    return { model: baseId, effort: desiredEffort };
   }
 
   return { model: modelInput, effort: explicitEffort };
@@ -241,6 +260,25 @@ async function fileExists(path) {
 }
 
 /**
+ * Checks whether a persisted models-cache.json payload is still fresh and matches
+ * the active bridge and agy CLI versions.
+ */
+export function isDiskModelCacheValid(
+  parsed,
+  { now = Date.now(), ttlMs = 15 * 60_000, bridgeVersion = '', agyVersion = '' } = {}
+) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return false;
+  if (!Number.isFinite(parsed.at)) return false;
+  const ageMs = now - parsed.at;
+  if (ageMs < 0 || ageMs >= ttlMs) return false;
+  if (!Array.isArray(parsed.infos) || parsed.infos.length === 0) return false;
+  if (str(parsed.bridgeVersion) !== str(bridgeVersion)) return false;
+  if (str(agyVersion) && str(parsed.agyVersion) !== str(agyVersion)) return false;
+  return true;
+}
+
+/**
  * Probes the local agy CLI for version, models, efforts, and health diagnostics.
  */
 export class CliProbe {
@@ -263,31 +301,40 @@ export class CliProbe {
   }
 
   async getModels(refresh = false) {
-    if (!refresh && this.modelsCache.infos.length > 0 && Date.now() - this.modelsCache.at < 30 * 60_000) {
+    const ttlMs = Number.isFinite(this.config.modelsCacheTtlMs) ? this.config.modelsCacheTtlMs : 15 * 60_000;
+    if (!refresh && ttlMs > 0 && this.modelsCache.infos.length > 0 && Date.now() - this.modelsCache.at < ttlMs) {
       return this.modelsCache.infos;
     }
 
     const isMock = Array.isArray(this.config.prefixArgs) && this.config.prefixArgs.some((a) => a.includes('mock-agy'));
     const cacheFile = !isMock && this.config.stateFile ? join(dirname(this.config.stateFile), 'models-cache.json') : '';
 
+    let staleDiskFallback = [];
+    let currentAgyVersion = '';
+
     if (!refresh && cacheFile && this.modelsCache.infos.length === 0) {
       try {
         const raw = await readFile(cacheFile, 'utf8');
         const parsed = JSON.parse(raw);
-        if (
-          parsed &&
-          Number.isFinite(parsed.at) &&
-          Date.now() - parsed.at < 86_400_000 &&
-          Array.isArray(parsed.infos) &&
-          parsed.infos.length > 0
-        ) {
-          this.modelsCache = {
-            at: parsed.at,
-            infos: parsed.infos,
-            source: parsed.source || 'disk-cache',
-            error: null
-          };
-          return parsed.infos;
+        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.infos) && parsed.infos.length > 0) {
+          staleDiskFallback = parsed.infos;
+          currentAgyVersion = (await this.getVersion()) || '';
+          if (
+            isDiskModelCacheValid(parsed, {
+              now: Date.now(),
+              ttlMs,
+              bridgeVersion: this.config.bridgeVersion || '',
+              agyVersion: currentAgyVersion
+            })
+          ) {
+            this.modelsCache = {
+              at: parsed.at,
+              infos: parsed.infos,
+              source: parsed.source || 'disk-cache',
+              error: null
+            };
+            return parsed.infos;
+          }
         }
       } catch {
         // Ignore missing/invalid disk cache and run live discovery below.
@@ -321,24 +368,47 @@ export class CliProbe {
         if (infos.length > 0) source = 'plaintext';
       } catch (e) {
         lastErr = redactSensitive(e?.message || e, [this.config.token]);
-        if (!this.modelsCache.infos.length) {
+        if (staleDiskFallback.length > 0) {
+          infos = staleDiskFallback;
+          source = 'stale-disk-cache';
+        } else if (!this.modelsCache.infos.length) {
           throw e;
         }
       }
     }
 
+    if (!infos.length && staleDiskFallback.length > 0) {
+      infos = staleDiskFallback;
+      source = 'stale-disk-cache';
+    } else if (!infos.length && this.modelsCache.infos.length > 0 && lastErr) {
+      infos = this.modelsCache.infos;
+      source = this.modelsCache.source || 'stale-memory-cache';
+    }
+
     const now = Date.now();
+    const isStaleFallback = source === 'stale-disk-cache' || source === 'stale-memory-cache';
     this.modelsCache = {
-      at: now,
+      at: isStaleFallback ? 0 : now,
       infos,
       source,
-      error: infos.length ? null : lastErr
+      error: infos.length && !isStaleFallback ? null : lastErr
     };
 
-    if (cacheFile && infos.length > 0) {
+    if (cacheFile && infos.length > 0 && !isStaleFallback) {
       try {
+        const agyVersion = currentAgyVersion || (await this.getVersion()) || '';
         await mkdir(dirname(cacheFile), { recursive: true });
-        await writeFile(cacheFile, JSON.stringify({ at: now, source, infos }), 'utf8');
+        await writeFile(
+          cacheFile,
+          JSON.stringify({
+            at: now,
+            bridgeVersion: this.config.bridgeVersion || '',
+            agyVersion,
+            source,
+            infos
+          }),
+          'utf8'
+        );
       } catch {
         // Best-effort disk caching only.
       }

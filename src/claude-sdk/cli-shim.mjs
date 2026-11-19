@@ -427,7 +427,7 @@ export async function runClaudeCodeAgyShim({
     try {
       await mkdir(workCwd, { recursive: true });
 
-      const { model, effort } = resolveAgyModelAndEffort(activeModel, activeEffort);
+      const { model, effort } = resolveAgyModelAndEffort(activeModel, activeEffort, cliProbe.modelsCache.infos);
       const permFlags = permissionArgs({ metadata: { permissionMode: activePermissionMode } }, config);
       const effectivePermissionMode = String(activePermissionMode || 'default').trim().toLowerCase();
       const allowWriteForTurn = effectivePermissionMode === 'plan' ? false : config.zoteroMcpAllowWrite;

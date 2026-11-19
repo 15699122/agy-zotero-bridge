@@ -177,6 +177,7 @@ export function createConfig(env = process.env, argv = []) {
     allowYolo: env.AGY_ALLOW_YOLO === '1',
     defaultModel: env.AGY_DEFAULT_MODEL || '',
     defaultEffort: env.AGY_DEFAULT_EFFORT || '',
+    modelsCacheTtlMs: Math.max(0, Number(env.AGY_MODELS_CACHE_TTL_MS ?? 15 * 60 * 1000)),
     defaultPermissionMode: env.AGY_PERMISSION_MODE || 'default',
     systemPromptFile: env.AGY_SYSTEM_PROMPT_FILE || '',
     skillsDir: env.AGY_SKILLS_DIR || '',

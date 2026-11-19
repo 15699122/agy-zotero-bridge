@@ -844,6 +844,23 @@ test('run-turn and efforts normalize base models, legacy suffixed variants, and 
 
   const f3 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-3', { model: 'gemini-3.8-flash', effort: 'auto' });
   assert.deepEqual(JSON.parse(f3.at(-1).outcome.text), { model: 'gemini-3.8-flash', effort: null });
+
+  const eNeon = await (await fetch(base + '/efforts?model=gemini-4-neon')).json();
+  assert.equal(eNeon.model, 'gemini-4-neon');
+  assert.deepEqual(eNeon.efforts, ['default', 'low', 'medium', 'high', 'xhigh']);
+
+  const eOrchNeon = await (await fetch(base + '/efforts?model=gemini-pro-orchestrator-neon')).json();
+  assert.equal(eOrchNeon.model, 'gemini-pro-orchestrator-neon');
+  assert.deepEqual(eOrchNeon.efforts, ['default']);
+
+  const f4 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-4', { model: 'gemini-4-neon', effort: 'max' });
+  assert.deepEqual(JSON.parse(f4.at(-1).outcome.text), { model: 'gemini-4-neon', effort: 'xhigh' });
+
+  const f5 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-5', { model: 'gemini-4-neon-low', effort: 'auto' });
+  assert.deepEqual(JSON.parse(f5.at(-1).outcome.text), { model: 'gemini-4-neon', effort: 'low' });
+
+  const f6 = await turn('MOCK_ECHO_MODEL_EFFORT', 'model-effort-6', { model: 'gemini-pro-orchestrator-neon', effort: 'high' });
+  assert.deepEqual(JSON.parse(f6.at(-1).outcome.text), { model: 'gemini-pro-orchestrator-neon', effort: null });
 });
 
 test('claude-code-agy.mjs speaks Claude Code CLI stream-json protocol for direct Claude Code path use', async () => {

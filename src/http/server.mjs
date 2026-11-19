@@ -235,6 +235,7 @@ export function createBridgeApp(config) {
           config,
           sessionStore,
           processPool,
+          knownModels: cliProbe.modelsCache.infos,
           onTools: updateTools,
           onMcpConfigured: updateCapturedMcp
         });
@@ -243,7 +244,12 @@ export function createBridgeApp(config) {
 
       if (req.method === 'POST' && path === '/structured-completion') {
         const body = await readJsonBody(req, config.maxBody);
-        const result = await runStructuredCompletion({ body, res, config });
+        const result = await runStructuredCompletion({
+          body,
+          res,
+          config,
+          knownModels: cliProbe.modelsCache.infos
+        });
         sendJson(res, 200, result);
         return;
       }
