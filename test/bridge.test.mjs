@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { createConfig } from '../src/config.mjs';
+import { startBridgeServer } from '../src/http/server.mjs';
 
 const folder = fileURLToPath(new URL('.', import.meta.url));
 const bridge = fileURLToPath(new URL('../bridge.mjs', import.meta.url));
@@ -1218,4 +1220,90 @@ test('M7-02 /v1/embeddings, /embeddings, and /v1/embeddings/status work over HTT
 
   const badRes = await post('/v1/embeddings', { input: [] });
   assert.equal(badRes.status, 400);
+});
+
+test('automatic CLI model & effort discovery adapts end-to-end without hardcoded model names', async () => {
+  const autoDir = await mkdtemp(join(tmpdir(), 'agy-auto-discover-'));
+  const prevHelp = process.env.MOCK_HELP_EFFORTS;
+  const prevModels = process.env.MOCK_MODELS_JSON;
+  let server = null;
+
+  try {
+    process.env.MOCK_HELP_EFFORTS = 'minimal|low|medium|high|xhigh|max|ultra';
+    process.env.MOCK_MODELS_JSON = JSON.stringify([
+      { id: 'gemini-6-xenon-minimal', label: 'Gemini 6 Xenon (Minimal)' },
+      { id: 'gemini-6-xenon-low', label: 'Gemini 6 Xenon (Low)' },
+      { id: 'gemini-6-xenon-ultra', label: 'Gemini 6 Xenon (Ultra)' },
+      { id: 'deep-research-v2', label: 'Deep Research v2' }
+    ]);
+
+    const cfg = createConfig({
+      AGY_BIN: binary,
+      AGY_PREFIX_ARGS_JSON: prefix,
+      AGY_CWD: autoDir,
+      AGY_BRIDGE_STATE: join(autoDir, 'sessions.json'),
+      AGY_BRIDGE_HOST: '127.0.0.1',
+      AGY_BRIDGE_PORT: '0'
+    });
+    ({ server } = await startBridgeServer(cfg));
+    const addr = server.address();
+    const autoBase = `http://127.0.0.1:${addr.port}`;
+
+    const mRes = await (await fetch(`${autoBase}/models`)).json();
+    assert.deepEqual(mRes.models, ['gemini-6-xenon', 'deep-research-v2']);
+    const xenonInfo = mRes.modelInfos.find((m) => m.value === 'gemini-6-xenon');
+    assert.deepEqual(xenonInfo.supportedEffortLevels, ['minimal', 'low', 'ultra']);
+    const deepInfo = mRes.modelInfos.find((m) => m.value === 'deep-research-v2');
+    assert.equal(deepInfo.supportsEffort, false);
+    assert.deepEqual(deepInfo.supportedEffortLevels, []);
+
+    const eXenon = await (await fetch(`${autoBase}/efforts?model=gemini-6-xenon`)).json();
+    assert.deepEqual(eXenon.efforts, ['default', 'minimal', 'low', 'ultra']);
+
+    const eDeep = await (await fetch(`${autoBase}/efforts?model=deep-research-v2`)).json();
+    assert.deepEqual(eDeep.efforts, ['default']);
+
+    const tXenon = await post(
+      '/run-turn',
+      {
+        conversationKey: 'auto-xenon',
+        userText: 'MOCK_ECHO_MODEL_EFFORT',
+        metadata: { model: 'gemini-6-xenon', effort: 'max' },
+        scopeType: 'paper',
+        scopeId: 'X1'
+      },
+      autoBase
+    );
+    const xenonFrames = (await tXenon.text()).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(JSON.parse(xenonFrames.at(-1).outcome.text), {
+      model: 'gemini-6-xenon',
+      effort: 'ultra'
+    });
+
+    const tDeep = await post(
+      '/run-turn',
+      {
+        conversationKey: 'auto-deep',
+        userText: 'MOCK_ECHO_MODEL_EFFORT',
+        metadata: { model: 'deep-research-v2', effort: 'high' },
+        scopeType: 'paper',
+        scopeId: 'X2'
+      },
+      autoBase
+    );
+    const deepFrames = (await tDeep.text()).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(JSON.parse(deepFrames.at(-1).outcome.text), {
+      model: 'deep-research-v2',
+      effort: null
+    });
+  } finally {
+    if (prevHelp === undefined) delete process.env.MOCK_HELP_EFFORTS;
+    else process.env.MOCK_HELP_EFFORTS = prevHelp;
+    if (prevModels === undefined) delete process.env.MOCK_MODELS_JSON;
+    else process.env.MOCK_MODELS_JSON = prevModels;
+    if (server) {
+      await new Promise((resolveClose) => server.close(() => resolveClose()));
+    }
+    await rm(autoDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
 });

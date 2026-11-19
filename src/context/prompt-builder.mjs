@@ -596,6 +596,8 @@ export function extractPaperScopeManifest(runtimeRequest) {
       if (!item) {
         const canonicalTextPath = str(entry.mineruFullMdPath || entry.contextFilePath).trim();
         const mineruCacheDir = str(entry.mineruCacheDir).trim();
+        const attachmentTitle = cleanLabel(entry.attachmentTitle, '');
+        const contentSourceMode = str(entry.contentSourceMode).trim().toLowerCase();
         const authors = Array.isArray(entry.authors)
           ? entry.authors.map((a) => cleanLabel(typeof a === 'string' ? a : a?.name || a?.lastName, '')).filter(Boolean)
           : cleanLabel(entry.authors || entry.author, '');
@@ -605,6 +607,8 @@ export function extractPaperScopeManifest(runtimeRequest) {
           ...(itemKey ? { itemKey } : {}),
           ...(libraryID ? { libraryID } : {}),
           title: title || `Paper ${itemId || contextItemId || itemKey}`,
+          ...(attachmentTitle ? { attachmentTitle } : {}),
+          ...(contentSourceMode ? { contentSourceMode } : {}),
           ...(entry.year ? { year: entry.year } : {}),
           ...(authors && (!Array.isArray(authors) || authors.length > 0) ? { authors } : {}),
           ...(str(entry.doi).trim() ? { doi: str(entry.doi).trim() } : {}),
@@ -733,6 +737,8 @@ export function compactRuntimeContext(runtimeRequest, maxChars = MAX_RUNTIME_CON
       ...(p.contextItemId ? { contextItemId: p.contextItemId } : {}),
       ...(p.itemKey ? { itemKey: p.itemKey } : {}),
       title: p.title,
+      ...(p.attachmentTitle ? { attachmentTitle: p.attachmentTitle } : {}),
+      ...(p.contentSourceMode ? { contentSourceMode: p.contentSourceMode } : {}),
       ...(p.year ? { year: p.year } : {}),
       roles: p.roles
     }))
@@ -800,7 +806,7 @@ function collectContextDirectoriesFromRuntime(runtime) {
       if (typeof item.mineruCacheDir === 'string' && item.mineruCacheDir.trim()) {
         dirs.push(item.mineruCacheDir.trim());
       }
-      for (const pathKey of ['mineruFullMdPath', 'contextFilePath']) {
+      for (const pathKey of ['mineruFullMdPath', 'contextFilePath', 'attachmentPath', 'filePath']) {
         const val = str(item[pathKey]).trim();
         if (val) dirs.push(dirname(val));
       }

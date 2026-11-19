@@ -4,8 +4,10 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  CliProbe,
   inferModelCapabilities,
   isDiskModelCacheValid,
+  parseEffortLevelsFromHelp,
   parseModelsStdout,
   resolveAgyModelAndEffort,
   splitModelVariant
@@ -1404,4 +1406,424 @@ test('isDiskModelCacheValid enforces TTL, bridgeVersion, and agyVersion invalida
     }),
     false
   );
+});
+
+test('parseEffortLevelsFromHelp extracts --help --effort tiers and tolerates missing/garbage output', () => {
+  assert.deepEqual(
+    parseEffortLevelsFromHelp(
+      'Usage of agy.exe:\n  --effort  Reasoning effort for the current CLI session (low|medium|high|xhigh|max)\n'
+    ),
+    ['low', 'medium', 'high', 'xhigh', 'max']
+  );
+
+  assert.deepEqual(
+    parseEffortLevelsFromHelp(
+      'Usage:\n  --effort  Reasoning effort (default: medium) (minimal|low|medium|high|xhigh|max|ultra)\n'
+    ),
+    ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+  );
+
+  assert.deepEqual(parseEffortLevelsFromHelp('Usage: agy\nNo effort flag here\n???'), []);
+  assert.deepEqual(parseEffortLevelsFromHelp(''), []);
+});
+
+test('zero-hardcode auto-discovery handles unseen models, new effort tiers, and fixed supportsEffort=false models', () => {
+  const extendedHelps = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  const futureStdout = [
+    'Fetching available models...',
+    JSON.stringify({
+      command: {
+        data: {
+          models: [
+            { id: 'gemini-6-xenon-minimal', label: 'Gemini 6 Xenon (Minimal)' },
+            { id: 'gemini-6-xenon-low', label: 'Gemini 6 Xenon (Low)' },
+            { id: 'gemini-6-xenon-ultra', label: 'Gemini 6 Xenon (Ultra)' },
+            { id: 'deep-research-v2', label: 'Deep Research v2' },
+            { id: 'structured-native-v1', label: 'Structured Native v1', efforts: ['low', 'turbo'], supportsEffort: true },
+            { id: 'fixed-explicit-v1', label: 'Fixed Explicit v1', supportsEffort: false }
+          ]
+        }
+      }
+    })
+  ].join('\n');
+
+  const infos = parseModelsStdout(futureStdout, { knownEfforts: extendedHelps });
+  assert.deepEqual(
+    infos.map((m) => m.value),
+    ['gemini-6-xenon', 'deep-research-v2', 'structured-native-v1', 'fixed-explicit-v1']
+  );
+
+  const xenon = infos.find((m) => m.value === 'gemini-6-xenon');
+  assert.equal(xenon.displayName, 'Gemini 6 Xenon');
+  assert.equal(xenon.supportsEffort, true);
+  assert.deepEqual(xenon.supportedEffortLevels, ['minimal', 'low', 'ultra']);
+  assert.deepEqual(xenon.supportedEfforts, ['default', 'minimal', 'low', 'ultra']);
+
+  const deep = infos.find((m) => m.value === 'deep-research-v2');
+  assert.equal(deep.supportsEffort, false);
+  assert.deepEqual(deep.supportedEffortLevels, []);
+  assert.deepEqual(deep.supportedEfforts, ['default']);
+
+  const structuredNative = infos.find((m) => m.value === 'structured-native-v1');
+  assert.deepEqual(structuredNative.supportedEffortLevels, ['low', 'turbo']);
+
+  const fixedExplicit = infos.find((m) => m.value === 'fixed-explicit-v1');
+  assert.equal(fixedExplicit.supportsEffort, false);
+  assert.deepEqual(fixedExplicit.supportedEffortLevels, []);
+
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-6-xenon', 'max', infos, extendedHelps), {
+    model: 'gemini-6-xenon',
+    effort: 'ultra'
+  });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-6-xenon', 'minimal', infos, extendedHelps), {
+    model: 'gemini-6-xenon',
+    effort: 'minimal'
+  });
+  assert.deepEqual(resolveAgyModelAndEffort('gemini-6-xenon-minimal', 'auto', infos, extendedHelps), {
+    model: 'gemini-6-xenon',
+    effort: 'minimal'
+  });
+  // Unseen non-orchestrator model with supportsEffort=false strips --effort automatically
+  assert.deepEqual(resolveAgyModelAndEffort('deep-research-v2', 'high', infos, extendedHelps), {
+    model: 'deep-research-v2',
+    effort: ''
+  });
+  assert.deepEqual(resolveAgyModelAndEffort('structured-native-v1', 'max', infos, extendedHelps), {
+    model: 'structured-native-v1',
+    effort: 'turbo'
+  });
+});
+
+test('CliProbe hydrates disk cache, triggers SWR background refresh past revalidateMs, and aborts cleanly on close', async () => {
+  const stubDir = await mkdtemp(join(tmpdir(), 'agy-probe-swr-'));
+  const stateDir = join(stubDir, 'state');
+  const stateFile = join(stateDir, 'sessions.json');
+  const cacheFile = join(stateDir, 'models-cache.json');
+  const modelsFile = join(stubDir, 'source-models.json');
+  const callsFile = join(stubDir, 'calls.log');
+  const slowFlagFile = join(stubDir, 'slow.flag');
+  const stubScript = join(stubDir, 'cli-stub.mjs');
+
+  try {
+    await writeFile(
+      modelsFile,
+      JSON.stringify([
+        { id: 'gemini-4-neon-low', label: 'Gemini 4 Neon (Low)' },
+        { id: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High)' }
+      ]),
+      'utf8'
+    );
+    await writeFile(callsFile, '', 'utf8');
+    await writeFile(
+      stubScript,
+      [
+        "import { appendFileSync, existsSync, readFileSync } from 'node:fs';",
+        'const args = process.argv.slice(2);',
+        `appendFileSync(${JSON.stringify(callsFile)}, args.join(' ') + '\\n');`,
+        `if (existsSync(${JSON.stringify(slowFlagFile)})) {`,
+        '  setTimeout(() => process.exit(0), 5000);',
+        "} else if (args.includes('--version')) {",
+        "  console.log('1.6.0');",
+        "} else if (args.includes('--help')) {",
+        "  console.log('  --effort  Reasoning effort for the current CLI session (minimal|low|medium|high|xhigh|max|ultra)');",
+        "} else if (args.includes('models')) {",
+        `  const list = JSON.parse(readFileSync(${JSON.stringify(modelsFile)}, 'utf8'));`,
+        '  console.log(JSON.stringify({ command: { data: { models: list } } }));',
+        '}'
+      ].join('\n'),
+      'utf8'
+    );
+
+    const cfg = createConfig(
+      {
+        AGY_BIN: process.execPath,
+        AGY_PREFIX_ARGS_JSON: JSON.stringify([stubScript]),
+        AGY_BRIDGE_STATE: stateFile,
+        AGY_MODELS_CACHE_TTL_MS: '60000',
+        AGY_MODELS_REVALIDATE_MS: '5000'
+      },
+      []
+    );
+
+    // 1. Cold discovery writes models-cache.json with version + effortLevels
+    const probe1 = new CliProbe(cfg);
+    const first = await probe1.getModels(false);
+    assert.deepEqual(
+      first.map((m) => m.value),
+      ['gemini-4-neon']
+    );
+    const writtenCache1 = JSON.parse(await readFile(cacheFile, 'utf8'));
+    assert.equal(writtenCache1.bridgeVersion, cfg.bridgeVersion);
+    assert.equal(writtenCache1.agyVersion, '1.6.0');
+    assert.ok(writtenCache1.effortLevels.includes('minimal'));
+    assert.ok(writtenCache1.effortLevels.includes('ultra'));
+    probe1.close();
+
+    // 2. Backdate cache past modelsCacheRevalidateMs (< ttlMs) and update source models
+    await writeFile(
+      modelsFile,
+      JSON.stringify([
+        { id: 'gemini-4-neon-low', label: 'Gemini 4 Neon (Low)' },
+        { id: 'gemini-6-xenon-minimal', label: 'Gemini 6 Xenon (Minimal)' },
+        { id: 'gemini-6-xenon-ultra', label: 'Gemini 6 Xenon (Ultra)' },
+        { id: 'deep-research-v2', label: 'Deep Research v2' }
+      ]),
+      'utf8'
+    );
+    writtenCache1.at = Date.now() - 10_000;
+    await writeFile(cacheFile, JSON.stringify(writtenCache1), 'utf8');
+
+    const probe2 = new CliProbe(cfg);
+    const swrImmediate = await probe2.getModels(false);
+    assert.deepEqual(
+      swrImmediate.map((m) => m.value),
+      ['gemini-4-neon']
+    );
+    assert.ok(probe2.liveRefreshPromise, 'SWR background refresh should have started');
+    await probe2.liveRefreshPromise;
+
+    const swrUpdated = await probe2.getModels(false);
+    assert.deepEqual(
+      swrUpdated.map((m) => m.value),
+      ['gemini-4-neon', 'gemini-6-xenon', 'deep-research-v2']
+    );
+    probe2.close();
+
+    // 3. hydrateDiskCache populates models & effortLevels on fresh probe without spawning CLI
+    await writeFile(callsFile, '', 'utf8');
+    const probe3 = new CliProbe(cfg);
+    const hydrated = await probe3.hydrateDiskCache();
+    assert.deepEqual(
+      hydrated.map((m) => m.value),
+      ['gemini-4-neon', 'gemini-6-xenon', 'deep-research-v2']
+    );
+    assert.ok(probe3.knownEffortLevels.includes('minimal'));
+    assert.ok(probe3.knownEffortLevels.includes('ultra'));
+    assert.equal(await readFile(callsFile, 'utf8'), '');
+    probe3.close();
+
+    // 4. close() aborts active refresh cleanly without unhandled rejections
+    await writeFile(slowFlagFile, '1', 'utf8');
+    const probe4 = new CliProbe({
+      ...cfg,
+      stateFile: join(stubDir, 'state-abort', 'sessions.json')
+    });
+    const bgPromise = probe4.refreshInBackground();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(probe4.activeRefreshControllers.size > 0);
+    probe4.close();
+    assert.equal(probe4.activeRefreshControllers.size, 0);
+    await bgPromise;
+  } finally {
+    await rm(stubDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test('MinerU .md + .doc/.docx SI routing rules, read_attachment/paper_read proxy diagnostics, and manifest fields work cleanly', () => {
+  // 1. Scoped rules route PDF vs non-PDF (.md/.docx) cleanly and preserve existing guarantees
+  const rules = buildScopedZoteroRulesMarkdown({ serverNames: ['llm_for_zotero_p1'], allowWrite: true });
+  assert.ok(rules.includes('`read_attachment`'));
+  assert.ok(rules.includes('maxChars'));
+  assert.ok(rules.includes('.docx'));
+  assert.ok(rules.includes('.doc'));
+  assert.ok(rules.includes('MinerU `.md`-only paper without a PDF'));
+  assert.ok(rules.includes('mode: "outline"'));
+  assert.ok(rules.includes('mode: "targeted"'));
+  assert.ok(rules.includes('Do NOT run shell commands (`run_command`)'));
+  assert.ok(rules.includes('writeEnabled: true'));
+
+  // 2. Legacy binary .doc garbled read_attachment payload is scrubbed and diagnosed cleanly
+  const garbledDoc = '\uFFFD\uFFFD\u0000\u0001\u0002ÐÏ\u0011à¡±\u001aá' + '\uFFFD'.repeat(18) + 'MSWordDoc';
+  const docResp = compactMcpToolCallResponse('read_attachment', { target: { contextItemId: 10810 } }, {
+    jsonrpc: '2.0',
+    id: 1,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            attachmentId: 10810,
+            title: 'Supporting_Info.doc',
+            contentType: 'application/msword',
+            category: 'binary',
+            filePath: 'C:\\Zotero\\storage\\ABC\\Supporting_Info.doc',
+            textContent: garbledDoc,
+            wordCount: 4
+          })
+        }
+      ]
+    }
+  });
+  const docParsed = JSON.parse(docResp.result.content[0].text);
+  assert.equal(docParsed.bridgeDiagnostic.code, 'unsupported_binary_doc');
+  assert.equal(docParsed.textContent, '');
+  assert.equal(docParsed.wordCount, 0);
+  assert.match(docParsed.note, /convert it to \.docx/i);
+
+  // 3. Empty / image-only .docx attachment triggers empty_or_image_only_docx diagnostic
+  const emptyDocxResp = compactMcpToolCallResponse('read_attachment', { target: { contextItemId: 10811 } }, {
+    jsonrpc: '2.0',
+    id: 2,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            attachmentId: 10811,
+            title: 'Figures_SI.docx',
+            contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            sourceMode: 'docx',
+            textContent: '',
+            wordCount: 0,
+            note: 'No plain text could be extracted from this DOCX attachment.'
+          })
+        }
+      ]
+    }
+  });
+  const emptyDocxParsed = JSON.parse(emptyDocxResp.result.content[0].text);
+  assert.equal(emptyDocxParsed.bridgeDiagnostic.code, 'empty_or_image_only_docx');
+
+  // 4. Valid non-empty .docx SI keeps textContent intact and attaches text-only notice
+  const validDocxResp = compactMcpToolCallResponse('read_attachment', { target: { contextItemId: 10812 } }, {
+    jsonrpc: '2.0',
+    id: 3,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            attachmentId: 10812,
+            title: 'Baranwal_SI.docx',
+            contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            sourceMode: 'docx',
+            textContent: 'Table S1. Primer sequences and thermal stability values.',
+            wordCount: 8
+          })
+        }
+      ]
+    }
+  });
+  const validDocxParsed = JSON.parse(validDocxResp.result.content[0].text);
+  assert.equal(validDocxParsed.textContent, 'Table S1. Primer sequences and thermal stability values.');
+  assert.equal(validDocxParsed.bridgeDiagnostic, undefined);
+  assert.match(validDocxParsed.bridgeNotice, /word\/document\.xml/i);
+
+  // 5. Default 50k truncated MinerU .md sets truncationHint only when maxChars was omitted
+  const truncatedMdText = `${'学术论文内容与实验数据\t摘要段落。\n'.repeat(3000)}`.slice(0, 49_999) + '\u2026';
+  const mdDefaultResp = compactMcpToolCallResponse('read_attachment', { target: { contextItemId: 10813 } }, {
+    jsonrpc: '2.0',
+    id: 4,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            attachmentId: 10813,
+            title: 'Baranwal_2022.md',
+            contentType: 'text/markdown',
+            sourceMode: 'markdown',
+            textContent: truncatedMdText
+          })
+        }
+      ]
+    }
+  });
+  const mdDefaultParsed = JSON.parse(mdDefaultResp.result.content[0].text);
+  assert.equal(mdDefaultParsed.bridgeDiagnostic, undefined);
+  assert.equal(mdDefaultParsed.truncatedAtDefaultMaxChars, true);
+  assert.match(mdDefaultParsed.truncationHint, /maxChars/);
+
+  const mdExplicitResp = compactMcpToolCallResponse(
+    'read_attachment',
+    { target: { contextItemId: 10813 }, maxChars: 200000 },
+    {
+      jsonrpc: '2.0',
+      id: 5,
+      result: {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              attachmentId: 10813,
+              contentType: 'text/markdown',
+              sourceMode: 'markdown',
+              textContent: truncatedMdText
+            })
+          }
+        ]
+      }
+    }
+  );
+  const mdExplicitParsed = JSON.parse(mdExplicitResp.result.content[0].text);
+  assert.equal(mdExplicitParsed.truncatedAtDefaultMaxChars, undefined);
+
+  // 6. paper_read unresolved target errors get explicit read_attachment bridge hint (plaintext + JSON + JSON-RPC error)
+  const prPlain = compactMcpToolCallResponse('paper_read', {}, {
+    jsonrpc: '2.0',
+    id: 6,
+    result: {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text: 'Could not resolve paper target itemId=10809, contextItemId=10810: no PDF or text attachment was found for it.'
+        }
+      ]
+    }
+  });
+  assert.match(prPlain.result.content[0].text, /\[Bridge hint:.*read_attachment/i);
+
+  const prJson = compactMcpToolCallResponse('paper_read', {}, {
+    jsonrpc: '2.0',
+    id: 7,
+    result: {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'Could not resolve paper target itemId=10809, contextItemId=10810: no PDF or text attachment was found for it.'
+          })
+        }
+      ]
+    }
+  });
+  const prJsonParsed = JSON.parse(prJson.result.content[0].text);
+  assert.match(prJsonParsed.bridgeHint, /read_attachment/i);
+
+  const prRpcErr = compactMcpToolCallResponse('paper_read', {}, {
+    jsonrpc: '2.0',
+    id: 8,
+    error: {
+      code: -32000,
+      message: 'Could not resolve paper target itemId=10809: no PDF or text attachment was found for it.'
+    }
+  });
+  assert.match(prRpcErr.error.message, /\[Bridge hint:.*read_attachment/i);
+
+  // 7. extractPaperScopeManifest preserves attachmentTitle and contentSourceMode for sibling MD + DOCX
+  const manifest = extractPaperScopeManifest({
+    selectedPaperContexts: [
+      {
+        itemId: 10809,
+        contextItemId: 10810,
+        title: 'Baranwal et al., 2022',
+        attachmentTitle: 'Baranwal_SI.docx',
+        contentSourceMode: 'docx'
+      },
+      {
+        itemId: 10809,
+        contextItemId: 10811,
+        title: 'Baranwal et al., 2022',
+        attachmentTitle: 'Baranwal_full.md',
+        contentSourceMode: 'markdown'
+      }
+    ]
+  });
+  assert.equal(manifest.length, 2);
+  assert.equal(manifest[0].attachmentTitle, 'Baranwal_SI.docx');
+  assert.equal(manifest[0].contentSourceMode, 'docx');
+  assert.equal(manifest[1].attachmentTitle, 'Baranwal_full.md');
+  assert.equal(manifest[1].contentSourceMode, 'markdown');
 });

@@ -427,7 +427,15 @@ export async function runClaudeCodeAgyShim({
     try {
       await mkdir(workCwd, { recursive: true });
 
-      const { model, effort } = resolveAgyModelAndEffort(activeModel, activeEffort, cliProbe.modelsCache.infos);
+      if (cliProbe.modelsCache.infos.length === 0) {
+        await cliProbe.hydrateDiskCache();
+      }
+      const { model, effort } = resolveAgyModelAndEffort(
+        activeModel,
+        activeEffort,
+        cliProbe.modelsCache.infos,
+        cliProbe.knownEffortLevels
+      );
       const permFlags = permissionArgs({ metadata: { permissionMode: activePermissionMode } }, config);
       const effectivePermissionMode = String(activePermissionMode || 'default').trim().toLowerCase();
       const allowWriteForTurn = effectivePermissionMode === 'plan' ? false : config.zoteroMcpAllowWrite;
@@ -1022,9 +1030,25 @@ export async function runClaudeCodeAgyShim({
         }
         let models = [];
         try {
-          models = await cliProbe.getModels(false);
+          const isMetadataProbe =
+            parsed.hasToolsFlag && parsed.tools === '' && Object.keys(activeMcpServers).length === 0;
+          if (isMetadataProbe) {
+            await cliProbe.hydrateDiskCache({ allowBackgroundRefresh: false });
+            const revalidateMs = Number.isFinite(config.modelsCacheRevalidateMs)
+              ? config.modelsCacheRevalidateMs
+              : 2 * 60_000;
+            const needsSyncRefresh =
+              cliProbe.modelsCache.infos.length === 0 ||
+              cliProbe.modelsCache.at === 0 ||
+              (revalidateMs > 0 && Date.now() - cliProbe.modelsCache.at >= revalidateMs);
+            models = needsSyncRefresh
+              ? await cliProbe.getModels(true)
+              : await cliProbe.getModels(false, { allowBackgroundRefresh: false });
+          } else {
+            models = await cliProbe.getModels(false);
+          }
         } catch {
-          models = [];
+          models = cliProbe.modelsCache.infos || [];
         }
         response = { models, commands: [], agents: [], account: null };
       } else if (subtype === 'mcp_status') {
@@ -1086,8 +1110,13 @@ export async function runClaudeCodeAgyShim({
   // Fallback for one-shot plaintext/prompt invocation if stdin isn't stream-json
   if (parsed.inputFormat !== 'stream-json') {
     const prompt = parsed.promptParts.join(' ').trim();
-    if (prompt) {
-      await executeTurn(prompt);
+    try {
+      if (prompt) {
+        await executeTurn(prompt);
+      }
+    } finally {
+      cliProbe.close();
+      closeWarmRuntime();
     }
     return 0;
   }
@@ -1126,6 +1155,7 @@ export async function runClaudeCodeAgyShim({
   await new Promise((resolveDone) => {
     rlIn.once('close', () => {
       void turnChain.finally(() => {
+        cliProbe.close();
         closeWarmRuntime();
         resolveDone();
       });

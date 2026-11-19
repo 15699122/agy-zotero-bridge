@@ -11,14 +11,31 @@ if (args.includes('--version')) {
   process.exit(0);
 }
 
+if (args.includes('--help')) {
+  const efforts = process.env.MOCK_HELP_EFFORTS || 'low|medium|high|xhigh|max';
+  console.log(`Usage of agy:\n  --effort  Reasoning effort for the current CLI session (${efforts})`);
+  process.exit(0);
+}
+
 if (args.includes('models')) {
   if (process.env.MOCK_MODELS_WITH_BANNER === '1') {
     console.log('Fetching available models...');
   }
+  let models = [{ id: 'gemini-mock', label: 'Gemini Mock' }];
+  if (process.env.MOCK_MODELS_JSON) {
+    try {
+      const parsed = JSON.parse(process.env.MOCK_MODELS_JSON);
+      if (Array.isArray(parsed) && parsed.length > 0) models = parsed;
+    } catch {
+      // Keep default mock list.
+    }
+  }
   if (args.includes('json')) {
-    console.log(JSON.stringify({ command: { data: { models: [{ id: 'gemini-mock', label: 'Gemini Mock' }] } } }));
+    console.log(JSON.stringify({ command: { data: { models } } }));
   } else {
-    console.log('gemini-mock\tGemini Mock');
+    for (const m of models) {
+      console.log(`${m.id}\t${m.label || m.id}`);
+    }
   }
   process.exit(0);
 }

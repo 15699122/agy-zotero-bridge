@@ -162,17 +162,122 @@ function compactLibraryReadNotes(data) {
   return changed;
 }
 
+function annotateReadAttachmentDiagnostics(data, rawArgs) {
+  if (!data || typeof data !== 'object') return false;
+  const payload =
+    data.result && typeof data.result === 'object' && !Array.isArray(data.result) ? data.result : data;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+
+  const contentType = String(payload.contentType || '').toLowerCase();
+  const fileHint = String(payload.filePath || payload.title || payload.attachmentTitle || '');
+  const sourceMode = String(payload.sourceMode || '').toLowerCase();
+  const rawText = typeof payload.textContent === 'string' ? payload.textContent : '';
+  const noteStr = String(payload.note || '');
+
+  const badChars = (rawText.match(/[\uFFFD\u0000-\u0008\u000E-\u001F]/g) || []).length;
+  const isLegacyDoc =
+    (/(?:^|;)application\/msword\b/i.test(contentType) || /\.doc$/i.test(fileHint)) &&
+    sourceMode !== 'docx' &&
+    !/\.docx$/i.test(fileHint);
+
+  if (
+    (isLegacyDoc && (badChars >= 8 || !rawText.trim())) ||
+    (!sourceMode && rawText.length >= 64 && badChars >= 16 && badChars / rawText.length >= 0.05)
+  ) {
+    payload.textContent = '';
+    payload.wordCount = 0;
+    payload.bridgeDiagnostic = {
+      code: 'unsupported_binary_doc',
+      message:
+        'Legacy binary Word (.doc) attachments cannot be decoded as plain text by llm-for-zotero read_attachment. Do not retry reading this .doc file; ask the user to convert it to .docx (for text) or .pdf / MinerU .md (for figures and text).'
+    };
+    if (!payload.note) {
+      payload.note = payload.bridgeDiagnostic.message;
+    }
+    return true;
+  }
+
+  const isDocx =
+    sourceMode === 'docx' || /wordprocessingml\.document/i.test(contentType) || /\.docx$/i.test(fileHint);
+  const missingLocalFile = /not available locally|could not resolve file path|attachment .* not found/i.test(noteStr);
+  if (
+    isDocx &&
+    (!rawText.trim() || /No plain text could be extracted from this DOCX/i.test(noteStr)) &&
+    !missingLocalFile
+  ) {
+    payload.bridgeDiagnostic = {
+      code: 'empty_or_image_only_docx',
+      message:
+        'No plain text was extracted from this .docx attachment (llm-for-zotero parses word/document.xml text only and skips embedded figures/images). Inform the user to convert visual/scanned SI files to .pdf or MinerU Markdown.'
+    };
+    return true;
+  }
+
+  let changed = false;
+  if (isDocx && rawText.trim().length > 0 && !payload.bridgeNotice) {
+    payload.bridgeNotice =
+      'DOCX text extracted from word/document.xml only; embedded figures/images inside .docx are not included.';
+    changed = true;
+  }
+  if (rawText.length >= 49_950 && rawText.endsWith('\u2026') && !(Number(rawArgs?.maxChars) > 0)) {
+    payload.truncatedAtDefaultMaxChars = true;
+    payload.truncationHint =
+      'Attachment text hit the default 50,000-char limit; call read_attachment again with a larger maxChars (e.g. 200000) if additional sections are needed.';
+    changed = true;
+  }
+
+  return changed;
+}
+
+function annotatePaperReadErrorHint(textOrData) {
+  const hint =
+    'If the target is a MinerU .md, .txt, .html, or .docx attachment (or a PDF-less item), call read_attachment({ target: { contextItemId } }) directly instead of paper_read; legacy .doc binaries must be converted to .docx or .pdf.';
+  if (typeof textOrData === 'string') {
+    if (!/no PDF or text attachment was found/i.test(textOrData) || textOrData.includes('[Bridge hint:')) {
+      return textOrData;
+    }
+    return `${textOrData}\n[Bridge hint: ${hint}]`;
+  }
+  if (!textOrData || typeof textOrData !== 'object') return false;
+  const messages = [
+    textOrData.error,
+    textOrData.message,
+    textOrData.result?.error,
+    textOrData.result?.message
+  ].filter((v) => typeof v === 'string');
+  if (messages.some((m) => /no PDF or text attachment was found/i.test(m)) && !textOrData.bridgeHint) {
+    textOrData.bridgeHint = hint;
+    return true;
+  }
+  return false;
+}
+
 /**
  * Compacts oversized Zotero MCP tool responses (`note_write` verification HTML/text,
  * long `library_read` note bodies, `paper_read` figures metadata, and >8 KB pretty JSON)
- * so agy does not spill huge JSON blobs to temp files and stall paging through them.
+ * and enriches `read_attachment` / `paper_read` diagnostics for `.md` and `.doc`/`.docx` flows.
  */
-export function compactMcpToolCallResponse(toolName, _rawArgs, rpcResponse) {
+export function compactMcpToolCallResponse(toolName, rawArgs, rpcResponse) {
   if (!rpcResponse || typeof rpcResponse !== 'object') return rpcResponse;
-  const content = rpcResponse?.result?.content;
-  if (!Array.isArray(content) || content.length === 0) return rpcResponse;
-
   const normalizedTool = String(toolName || '').trim().toLowerCase();
+
+  let nextRpc = rpcResponse;
+  if (normalizedTool === 'paper_read' && typeof rpcResponse.error?.message === 'string') {
+    const hintedErr = annotatePaperReadErrorHint(rpcResponse.error.message);
+    if (hintedErr !== rpcResponse.error.message) {
+      nextRpc = {
+        ...rpcResponse,
+        error: {
+          ...rpcResponse.error,
+          message: hintedErr
+        }
+      };
+    }
+  }
+
+  const content = nextRpc?.result?.content;
+  if (!Array.isArray(content) || content.length === 0) return nextRpc;
+
   let anyChanged = false;
   const nextContent = content.map((item) => {
     if (!item || item.type !== 'text' || typeof item.text !== 'string') return item;
@@ -180,6 +285,21 @@ export function compactMcpToolCallResponse(toolName, _rawArgs, rpcResponse) {
     try {
       data = JSON.parse(item.text);
     } catch {
+      if (normalizedTool === 'paper_read') {
+        const hinted = annotatePaperReadErrorHint(item.text);
+        if (hinted !== item.text) {
+          anyChanged = true;
+          return { ...item, text: hinted };
+        }
+      }
+      return item;
+    }
+    if (typeof data === 'string' && normalizedTool === 'paper_read') {
+      const hinted = annotatePaperReadErrorHint(data);
+      if (hinted !== data) {
+        anyChanged = true;
+        return { ...item, text: JSON.stringify(hinted) };
+      }
       return item;
     }
     if (!data || typeof data !== 'object') return item;
@@ -201,6 +321,11 @@ export function compactMcpToolCallResponse(toolName, _rawArgs, rpcResponse) {
         }
       }
     }
+    if (normalizedTool === 'read_attachment') {
+      if (annotateReadAttachmentDiagnostics(data, rawArgs)) modified = true;
+    } else if (normalizedTool === 'paper_read') {
+      if (annotatePaperReadErrorHint(data)) modified = true;
+    }
 
     if (!modified && item.text.length <= 8000) return item;
     anyChanged = true;
@@ -210,11 +335,11 @@ export function compactMcpToolCallResponse(toolName, _rawArgs, rpcResponse) {
     };
   });
 
-  if (!anyChanged) return rpcResponse;
+  if (!anyChanged) return nextRpc;
   return {
-    ...rpcResponse,
+    ...nextRpc,
     result: {
-      ...rpcResponse.result,
+      ...nextRpc.result,
       content: nextContent
     }
   };

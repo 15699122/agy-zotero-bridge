@@ -223,6 +223,9 @@ export function createBridgeApp(config) {
 
       if (req.method === 'POST' && path === '/run-turn') {
         const body = await readJsonBody(req, config.maxBody);
+        if (cliProbe.modelsCache.infos.length === 0) {
+          await cliProbe.hydrateDiskCache();
+        }
         res.writeHead(200, {
           'Content-Type': 'application/x-ndjson; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
@@ -236,6 +239,7 @@ export function createBridgeApp(config) {
           sessionStore,
           processPool,
           knownModels: cliProbe.modelsCache.infos,
+          knownEfforts: cliProbe.knownEffortLevels,
           onTools: updateTools,
           onMcpConfigured: updateCapturedMcp
         });
@@ -244,11 +248,15 @@ export function createBridgeApp(config) {
 
       if (req.method === 'POST' && path === '/structured-completion') {
         const body = await readJsonBody(req, config.maxBody);
+        if (cliProbe.modelsCache.infos.length === 0) {
+          await cliProbe.hydrateDiskCache();
+        }
         const result = await runStructuredCompletion({
           body,
           res,
           config,
-          knownModels: cliProbe.modelsCache.infos
+          knownModels: cliProbe.modelsCache.infos,
+          knownEfforts: cliProbe.knownEffortLevels
         });
         sendJson(res, 200, result);
         return;
@@ -358,8 +366,10 @@ export function createBridgeApp(config) {
       await mkdir(config.root, { recursive: true });
       await sessionStore.load();
       await embeddingService.load();
+      await cliProbe.hydrateDiskCache();
     },
     async close() {
+      cliProbe.close();
       processPool.close();
     }
   };
